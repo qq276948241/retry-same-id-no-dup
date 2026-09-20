@@ -1,0 +1,561 @@
+import os
+import time as time_module
+import zoneinfo
+from collections.abc import Callable
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
+from ipaddress import IPv4Address, IPv6Address
+from uuid import UUID
+
+import pytest
+
+from clickhouse_connect import common
+from clickhouse_connect.driver.client import Client
+from clickhouse_connect.driver.exceptions import DataError
+
+HAS_TZSET = hasattr(time_module, "tzset")
+
+
+@pytest.fixture
+def naive_datetime_server_environment(monkeypatch):
+    original_insert_setting = common.get_setting("naive_datetime_insert")
+    original_binding_setting = common.get_setting("naive_datetime_binding")
+    original_tz = os.environ.get("TZ")
+    try:
+        monkeypatch.setenv("TZ", "America/New_York")
+        time_module.tzset()
+        common.set_setting("naive_datetime_insert", "server")
+        common.set_setting("naive_datetime_binding", "wall")
+        yield
+    finally:
+        common.set_setting("naive_datetime_insert", original_insert_setting)
+        common.set_setting("naive_datetime_binding", original_binding_setting)
+        if original_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", original_tz)
+        time_module.tzset()
+
+
+def test_insert(param_client: Client, call, test_table_engine: str):
+    call(param_client.command, "DROP TABLE IF EXISTS test_system_insert")
+    call(param_client.command, f"CREATE TABLE test_system_insert AS system.tables Engine {test_table_engine} ORDER BY name")
+    tables_result = call(param_client.query, "SELECT * from system.tables")
+    call(param_client.insert, table="test_system_insert", column_names="*", data=tables_result.result_set)
+    copy_result = call(param_client.command, "SELECT count() from test_system_insert")
+    assert tables_result.row_count == copy_result
+    call(param_client.command, "DROP TABLE IF EXISTS test_system_insert")
+
+
+@pytest.mark.skipif(not HAS_TZSET, reason="time.tzset is required")
+def test_naive_datetime_server_insert_matches_wall_bind(
+    param_client: Client,
+    call,
+    table_context: Callable,
+    naive_datetime_server_environment,
+):
+    columns = [
+        "key UInt8",
+        "dt DateTime",
+        "dt64 DateTime64(6)",
+        "dt_tz DateTime('America/Chicago')",
+        "dt64_tz DateTime64(6, 'America/Chicago')",
+        "nullable_dt Nullable(DateTime)",
+        "dt_array Array(DateTime)",
+        "dt_tuple Tuple(DateTime, String)",
+        "dt_tuple_array Array(Tuple(DateTime64(6), String))",
+    ]
+    with table_context("test_naive_datetime_server_insert", columns):
+        value = datetime(2025, 7, 15, 12, 34, 56, 250306)
+        data = [[13, value, value, value, value, value, [value], (value, "user_1"), [(value, "user_2")]]]
+        call(param_client.insert, "test_naive_datetime_server_insert", data)
+        result = call(
+            param_client.query,
+            "SELECT count() FROM test_naive_datetime_server_insert "
+            "WHERE dt = {dt:DateTime} "
+            "AND dt64 = {dt64:DateTime64(6)} "
+            "AND dt_tz = {dt_tz:DateTime('America/Chicago')} "
+            "AND dt64_tz = {dt64_tz:DateTime64(6, 'America/Chicago')} "
+            "AND nullable_dt = {nullable_dt:Nullable(DateTime)} "
+            "AND dt_array = {dt_array:Array(DateTime)} "
+            "AND dt_tuple = {dt_tuple:Tuple(DateTime, String)} "
+            "AND dt_tuple_array = {dt_tuple_array:Array(Tuple(DateTime64(6), String))}",
+            parameters={
+                "dt": value,
+                "dt64": value,
+                "dt_tz": value,
+                "dt64_tz": value,
+                "nullable_dt": value,
+                "dt_array": [value],
+                "dt_tuple": (value, "user_1"),
+                "dt_tuple_array": [(value, "user_2")],
+            },
+        )
+        assert result.first_item["count()"] == 1
+
+
+def test_insert_context_uses_client_server_timezone(param_client: Client, call):
+    original_server_tz = param_client.server_tz
+    server_tz = zoneinfo.ZoneInfo("America/Chicago")
+    try:
+        param_client.server_tz = server_tz
+        context = call(
+            param_client.create_insert_context,
+            "unused_table",
+            column_names=["value"],
+            column_type_names=["DateTime"],
+        )
+
+        assert context.server_tz == server_tz
+    finally:
+        param_client.server_tz = original_server_tz
+
+
+@pytest.mark.parametrize("type_name", ["Date", "Date32"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_insert_date_calendar_values(param_client, call, table_context, type_name, reverse):
+    columns = [
+        "id UInt8",
+        f"d {type_name}",
+        f"n Nullable({type_name})",
+        f"a Array({type_name})",
+        f"t Tuple({type_name})",
+        f"at Array(Tuple(Nullable({type_name})))",
+        f"lc LowCardinality({type_name})",
+        f"lcn LowCardinality(Nullable({type_name}))",
+        f"alc Array(LowCardinality(Nullable({type_name})))",
+    ]
+    values = [
+        datetime(2024, 1, 1, 0, 30, tzinfo=timezone(timedelta(hours=14))),
+        datetime(2023, 12, 31, 10, 30, tzinfo=timezone.utc),
+        datetime(2023, 12, 31, 23, 30, tzinfo=timezone(timedelta(hours=-12))),
+        datetime(2024, 2, 29, 23, 59, 59, 999999),
+        date(2024, 3, 21),
+    ]
+    expected = [date(2024, 1, 1), date(2023, 12, 31), date(2023, 12, 31), date(2024, 2, 29), date(2024, 3, 21)]
+    if type_name == "Date32":
+        values.append(datetime(1969, 12, 31, 23, 30, tzinfo=timezone(timedelta(hours=-12))))
+        expected.append(date(1969, 12, 31))
+    if reverse:
+        values.reverse()
+        expected.reverse()
+    rows = [
+        [i, value, None if i == 0 else value, [value], (value,), [(None,), (value,)], value, value, [None, value]]
+        for i, value in enumerate(values)
+    ]
+    expected_rows = [
+        (i, value, None if i == 0 else value, [value], (value,), [(None,), (value,)], value, value, [None, value])
+        for i, value in enumerate(expected)
+    ]
+
+    with table_context("test_date_calendar_values", columns):
+        call(param_client.insert, "test_date_calendar_values", rows)
+        result = call(param_client.query, "SELECT * FROM test_date_calendar_values ORDER BY id")
+        assert result.result_rows == expected_rows
+
+
+def test_decimal_conv(param_client: Client, call, table_context: Callable):
+    with table_context("test_num_conv", ["col1 UInt64", "col2 Int32", "f1 Float64"]):
+        data = [[Decimal(5), Decimal(-182), Decimal(55.2)], [Decimal(57238478234), Decimal(77), Decimal(-29.5773)]]
+        call(param_client.insert, "test_num_conv", data)
+        result = call(param_client.query, "SELECT * FROM test_num_conv").result_set
+        assert result == [(5, -182, 55.2), (57238478234, 77, -29.5773)]
+
+
+def test_float_decimal_conv(param_client: Client, call, table_context: Callable):
+    with table_context("test_float_to_dec_conv", ["col1 Decimal32(6)", "col2 Decimal32(6)", "col3 Decimal128(6)", "col4 Decimal128(6)"]):
+        data = [[0.492917, 0.49291700, 0.492917, 0.49291700]]
+        call(param_client.insert, "test_float_to_dec_conv", data)
+        result = call(param_client.query, "SELECT * FROM test_float_to_dec_conv").result_set
+        assert result == [(Decimal("0.492917"), Decimal("0.492917"), Decimal("0.492917"), Decimal("0.492917"))]
+
+
+def test_rust_codec_insert(client_factory, call, table_context: Callable):
+    pytest.importorskip("_ch_core")
+    rust_client = client_factory(native_codec="rust_strict")
+    python_client = client_factory(native_codec="python")
+
+    columns = [
+        "id UInt32",
+        "b Bool",
+        "i Int32",
+        "u UInt64",
+        "f Float64",
+        "s String",
+        "fs FixedString(4)",
+        "n Nullable(Int32)",
+        "d Date",
+        "dt DateTime",
+        "ts DateTime64(3)",
+        "e Enum8('red' = 1, 'green' = 2)",
+        "dec Decimal(18, 4)",
+        "uuid_col UUID",
+        "ip4 IPv4",
+        "ip6 IPv6",
+        "lc LowCardinality(String)",
+        "lcn LowCardinality(Nullable(String))",
+    ]
+    data = [
+        [
+            1,
+            True,
+            -13,
+            79,
+            1.25,
+            "user_1",
+            "abcd",
+            13,
+            date(2024, 1, 15),
+            1705322096,
+            1705322096789,
+            "red",
+            Decimal("123.4567"),
+            UUID("00112233-4455-6677-8899-aabbccddeeff"),
+            "192.0.2.1",
+            IPv6Address("2001:db8::1"),
+            "x",
+            "nx",
+        ],
+        [
+            2,
+            False,
+            -79,
+            500,
+            -2.5,
+            "user_2",
+            "xy",
+            None,
+            19738,
+            1705322097,
+            1705322097790,
+            2,
+            "-1.5",
+            "11111111-2222-3333-4444-555555555555",
+            IPv4Address("198.51.100.7"),
+            "2001:db8::2",
+            "x",
+            None,
+        ],
+    ]
+    expected = [
+        (
+            1,
+            True,
+            -13,
+            79,
+            1.25,
+            "user_1",
+            b"abcd",
+            13,
+            19737,
+            1705322096,
+            1705322096789,
+            "red",
+            Decimal("123.4567"),
+            UUID("00112233-4455-6677-8899-aabbccddeeff"),
+            IPv4Address("192.0.2.1"),
+            IPv6Address("2001:db8::1"),
+            "x",
+            "nx",
+        ),
+        (
+            2,
+            False,
+            -79,
+            500,
+            -2.5,
+            "user_2",
+            b"xy\x00\x00",
+            None,
+            19738,
+            1705322097,
+            1705322097790,
+            "green",
+            Decimal("-1.5000"),
+            UUID("11111111-2222-3333-4444-555555555555"),
+            IPv4Address("198.51.100.7"),
+            IPv6Address("2001:db8::2"),
+            "x",
+            None,
+        ),
+    ]
+
+    with table_context("test_rust_native_insert", columns):
+        call(
+            rust_client.insert,
+            "test_rust_native_insert",
+            data,
+        )
+        result = call(
+            python_client.query,
+            "SELECT * FROM test_rust_native_insert ORDER BY id",
+            query_formats={"Date": "int", "DateTime": "int", "DateTime64": "int"},
+        ).result_rows
+        assert result == expected
+
+
+def test_rust_codec_time_insert(client_factory, call, test_config, test_table_engine: str):
+    pytest.importorskip("_ch_core")
+    if test_config.cloud:
+        pytest.skip("Time/Time64 settings are locked in ClickHouse Cloud")
+
+    version_client = client_factory(native_codec="python")
+    if not version_client.min_version("25.6"):
+        pytest.skip("Time and Time64 require ClickHouse 25.6+")
+
+    settings = {"enable_time_time64_type": 1}
+    rust_client = client_factory(native_codec="rust_strict", settings=settings)
+    python_client = client_factory(native_codec="python", settings=settings)
+
+    table = "test_rust_native_time_insert"
+    columns = (
+        "id UInt32, t Time, nt Nullable(Time), t64 Time64(6), "
+        "nt64 Nullable(Time64(6)), a Array(Time64(6)), "
+        "pair Tuple(Time, Nullable(Time64(6)))"
+    )
+    rows = [
+        [
+            13,
+            timedelta(seconds=-5),
+            None,
+            timedelta(seconds=-5, microseconds=-500_000),
+            None,
+            [timedelta(microseconds=1), timedelta(hours=1, minutes=2, seconds=3, microseconds=123_456)],
+            (timedelta(seconds=-13), None),
+        ],
+        [
+            79,
+            time(1, 2, 3),
+            "030:00:00",
+            time(1, 2, 3, 123_456),
+            "002:00:00.000079",
+            ["-000:00:05.500000", 79],
+            (79, 79),
+        ],
+    ]
+    expected = [
+        (
+            13,
+            timedelta(seconds=-5),
+            None,
+            timedelta(seconds=-5, microseconds=-500_000),
+            None,
+            [timedelta(microseconds=1), timedelta(hours=1, minutes=2, seconds=3, microseconds=123_456)],
+            (timedelta(seconds=-13), None),
+        ),
+        (
+            79,
+            timedelta(hours=1, minutes=2, seconds=3),
+            timedelta(hours=30),
+            timedelta(hours=1, minutes=2, seconds=3, microseconds=123_456),
+            timedelta(hours=2, microseconds=79),
+            [timedelta(seconds=-5, microseconds=-500_000), timedelta(microseconds=79)],
+            (timedelta(seconds=79), timedelta(microseconds=79)),
+        ),
+    ]
+
+    call(rust_client.command, f"DROP TABLE IF EXISTS {table}")
+    try:
+        call(rust_client.command, f"CREATE TABLE {table} ({columns}) ENGINE {test_table_engine} ORDER BY id")
+        call(rust_client.insert, table, rows)
+        result = call(python_client.query, f"SELECT * FROM {table} ORDER BY id").result_rows
+        assert result == expected
+
+        parity_rows = [
+            [13, timedelta(microseconds=-1), timedelta(seconds=-5, microseconds=-500_000)],
+            [79, timedelta(seconds=79), timedelta(microseconds=-1)],
+        ]
+        parity_expected = [
+            (13, timedelta(0), timedelta(seconds=-5, microseconds=-500_000)),
+            (79, timedelta(seconds=79), timedelta(microseconds=-1)),
+        ]
+        results = []
+        for insert_client in (rust_client, python_client):
+            call(rust_client.command, f"TRUNCATE TABLE {table}")
+            call(insert_client.insert, table, parity_rows, column_names=["id", "t", "t64"])
+            results.append(call(python_client.query, f"SELECT id, t, t64 FROM {table} ORDER BY id").result_rows)
+        assert results == [parity_expected, parity_expected]
+
+        np = pytest.importorskip("numpy")
+        numpy_columns = [
+            np.array([13, 79], dtype="uint32"),
+            np.array([13, "NaT"], dtype="timedelta64[s]"),
+            np.array([1, "NaT"], dtype="timedelta64[us]"),
+        ]
+        numpy_expected = [(13, timedelta(seconds=13), timedelta(microseconds=1)), (79, None, None)]
+        results = []
+        for insert_client in (rust_client, python_client):
+            call(rust_client.command, f"TRUNCATE TABLE {table}")
+            call(
+                insert_client.insert,
+                table,
+                numpy_columns,
+                column_names=["id", "nt", "nt64"],
+                column_oriented=True,
+            )
+            results.append(call(python_client.query, f"SELECT id, nt, nt64 FROM {table} ORDER BY id").result_rows)
+        assert results == [numpy_expected, numpy_expected]
+
+        pd = pytest.importorskip("pandas")
+        frame = pd.DataFrame(
+            {
+                "id": [13, 79],
+                "t": [timedelta(seconds=5), timedelta(hours=1)],
+                "t64": [
+                    timedelta(seconds=1, microseconds=79),
+                    timedelta(seconds=-5, microseconds=-500_000),
+                ],
+                "nt": pd.to_timedelta(["13s", None]),
+                "nt64": pd.to_timedelta([None, "0.000079s"]),
+            }
+        )
+        frame_expected = [
+            (13, timedelta(seconds=5), timedelta(seconds=1, microseconds=79), timedelta(seconds=13), None),
+            (79, timedelta(hours=1), timedelta(seconds=-5, microseconds=-500_000), None, timedelta(microseconds=79)),
+        ]
+        results = []
+        for insert_client in (rust_client, python_client):
+            call(rust_client.command, f"TRUNCATE TABLE {table}")
+            call(insert_client.insert_df, table, frame)
+            results.append(call(python_client.query, f"SELECT id, t, t64, nt, nt64 FROM {table} ORDER BY id").result_rows)
+        assert results == [frame_expected, frame_expected]
+    finally:
+        call(rust_client.command, f"DROP TABLE IF EXISTS {table}")
+
+
+def test_rust_codec_insert_dataframe(client_factory, call, table_context: Callable):
+    pytest.importorskip("_ch_core")
+    pd = pytest.importorskip("pandas")
+    rust_client = client_factory(native_codec="rust_strict")
+    python_client = client_factory(native_codec="python")
+
+    data = pd.DataFrame(
+        {
+            "id": [13, 79],
+            "name": ["user_1", "user_2"],
+            "score": [Decimal("12.30"), Decimal("45.60")],
+        }
+    )
+
+    with table_context("test_rust_native_insert_df", ["id Int32", "name String", "score Decimal(9, 2)"]):
+        call(
+            rust_client.insert_df,
+            "test_rust_native_insert_df",
+            data,
+        )
+        result = call(python_client.query, "SELECT * FROM test_rust_native_insert_df ORDER BY id").result_rows
+        assert result == [(13, "user_1", Decimal("12.30")), (79, "user_2", Decimal("45.60"))]
+
+
+def test_rust_codec_insert_numpy(client_factory, call, table_context: Callable):
+    pytest.importorskip("_ch_core")
+    np = pytest.importorskip("numpy")
+    rust_client = client_factory(native_codec="rust_strict")
+    python_client = client_factory(native_codec="python")
+
+    data = np.array([(13, 1.25), (79, 2.5)], dtype=[("id", "<i4"), ("value", "<f8")])
+
+    with table_context("test_rust_native_insert_numpy", ["id Int32", "value Float64"]):
+        call(
+            rust_client.insert,
+            "test_rust_native_insert_numpy",
+            data,
+            column_names=["id", "value"],
+        )
+        result = call(python_client.query, "SELECT * FROM test_rust_native_insert_numpy ORDER BY id").result_rows
+        assert result == [(13, 1.25), (79, 2.5)]
+
+
+def test_bad_data_insert(param_client: Client, call, table_context: Callable):
+    with table_context("test_bad_insert", ["key Int32", "float_col Float64"]):
+        data = [[1, 3.22], [2, "nope"]]
+        with pytest.raises(DataError, match="array"):
+            call(param_client.insert, "test_bad_insert", data)
+
+
+def test_bad_strings(param_client: Client, call, table_context: Callable):
+    with table_context("test_bad_strings", "key Int32, fs FixedString(6), nsf Nullable(FixedString(4))"):
+        try:
+            call(param_client.insert, "test_bad_strings", [[1, b"\x0535", None]])
+        except DataError as ex:
+            assert "match" in str(ex)
+        try:
+            call(param_client.insert, "test_bad_strings", [[1, b"\x0535abc", "😀🙃"]])
+        except DataError as ex:
+            assert "encoded" in str(ex)
+
+
+def test_fixed_string_empty_bytes(param_client: Client, call, table_context: Callable):
+    with table_context(
+        "test_fs_empty_bytes",
+        "key Int32, fs FixedString(6), nfs Nullable(FixedString(6)), afs Array(FixedString(6))",
+    ):
+        empty = b"\x00" * 6
+        data = [
+            [79, b"needle", b"abcdef", [b"needle", b""]],
+            [13, b"", b"", [b"", b"abcdef"]],
+        ]
+        call(param_client.insert, "test_fs_empty_bytes", data)
+        result = call(param_client.query, "SELECT key, fs, nfs, afs FROM test_fs_empty_bytes ORDER BY key").result_set
+        assert result == [
+            (13, empty, empty, [empty, b"abcdef"]),
+            (79, b"needle", b"abcdef", [b"needle", empty]),
+        ]
+        with pytest.raises(DataError, match="does not match column size"):
+            call(param_client.insert, "test_fs_empty_bytes", [[102, b"abc", None, []]])
+        # None into a non-nullable FixedString fails with TypeError from len(None).
+        # Current behavior, not a promised contract.
+        with pytest.raises(TypeError):
+            call(param_client.insert, "test_fs_empty_bytes", [[102, None, b"abcdef", []]])
+
+    with table_context("test_lc_fs_empty_bytes", "key Int32, lc LowCardinality(FixedString(6))"):
+        call(param_client.insert, "test_lc_fs_empty_bytes", [[79, b"needle"], [13, b""]])
+        result = call(param_client.query, "SELECT key, lc FROM test_lc_fs_empty_bytes ORDER BY key").result_set
+        assert result == [(13, b"\x00" * 6), (79, b"needle")]
+
+
+def test_low_card_dictionary_size(param_client: Client, call, table_context: Callable):
+    with table_context("test_low_card_dict", "key Int32, lc LowCardinality(String)", settings={"index_granularity": 65536}):
+        data = [[x, str(x)] for x in range(30000)]
+        call(param_client.insert, "test_low_card_dict", data)
+        assert 30000 == call(param_client.command, "SELECT count() FROM test_low_card_dict")
+
+
+def test_column_names_spaces(param_client: Client, call, table_context: Callable):
+    with table_context("test_column_spaces", columns=["key 1", "value 1"], column_types=["Int32", "String"]):
+        data = [[1, "str 1"], [2, "str 2"]]
+        call(param_client.insert, "test_column_spaces", data)
+        result = call(param_client.query, "SELECT * FROM test_column_spaces").result_rows
+        assert result[0][0] == 1
+        assert result[1][1] == "str 2"
+
+
+def test_numeric_conversion(param_client: Client, call, table_context: Callable):
+    with table_context("test_numeric_convert", columns=["key Int32", "n_int Nullable(UInt64)", "n_flt Nullable(Float64)"]):
+        data = [[1, None, None], [2, "2", "5.32"]]
+        call(param_client.insert, "test_numeric_convert", data)
+        result = call(param_client.query, "SELECT * FROM test_numeric_convert").result_rows
+        assert result[1][1] == 2
+        assert result[1][2] == float("5.32")
+        call(param_client.command, "TRUNCATE TABLE test_numeric_convert")
+        data = [[0, "55", "532.48"], [1, None, None], [2, "2", "5.32"]]
+        call(param_client.insert, "test_numeric_convert", data)
+        result = call(param_client.query, "SELECT * FROM test_numeric_convert").result_rows
+        assert result[0][1] == 55
+        assert result[0][2] == 532.48
+        assert result[1][1] is None
+        assert result[2][1] == 2
+        assert result[2][2] == 5.32
+
+
+def test_insert_table_name_with_unescaped_inner_backtick(param_client: Client, call, test_table_engine: str):
+    # A table name wrapped in backticks but containing unescaped inner backticks must be re-escaped.
+    raw_table = "`quote`insert`"
+    quoted_table = "`\\`quote\\`insert\\``"
+    call(param_client.command, f"DROP TABLE IF EXISTS {quoted_table}")
+    try:
+        call(param_client.command, f"CREATE TABLE {quoted_table} (id UInt32) ENGINE {test_table_engine} ORDER BY id")
+        call(param_client.insert, raw_table, [[13]], column_names=["id"])
+        assert call(param_client.command, f"SELECT count() FROM {quoted_table}") == 1
+    finally:
+        call(param_client.command, f"DROP TABLE IF EXISTS {quoted_table}")

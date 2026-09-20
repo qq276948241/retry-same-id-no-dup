@@ -1,0 +1,827 @@
+import asyncio
+import gc
+import gzip
+import logging
+import threading
+import time
+import weakref
+import zlib
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import Mock
+
+import lz4.frame
+import pytest
+
+from clickhouse_connect.driver.compression import _zstd_compress
+from clickhouse_connect.driver.exceptions import NotSupportedError, OperationalError
+from clickhouse_connect.driver.streaming import (
+    ReadAheadSource,
+    StreamingInsertSource,
+    StreamingResponseSource,
+    _finalize_read_ahead_off_loop,
+    _SyncStreamingInsertSource,
+)
+
+
+class MockAsyncIterator:
+    """Mock async iterator for simulating aiohttp response content."""
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.index = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.index >= len(self.chunks):
+            raise StopAsyncIteration
+        chunk = self.chunks[self.index]
+        self.index += 1
+        return chunk
+
+
+class MockContent:
+    """Mock aiohttp StreamReader content."""
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.index = 0
+
+    async def read(self, n=-1):
+        """Mock read method that returns chunks sequentially."""
+        if self.index >= len(self.chunks):
+            return b""
+        chunk = self.chunks[self.index]
+        self.index += 1
+        return chunk
+
+
+class MockResponse:
+    """Mock aiohttp ClientResponse."""
+
+    def __init__(self, chunks, encoding=None):
+        self.content = MockContent(chunks)
+        self.headers = {"Content-Encoding": encoding} if encoding else {}
+        self.status = 200
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_basic_streaming_no_compression():
+    """Test basic streaming without compression."""
+    chunks = [b"hello ", b"world", b"!"]
+    response = MockResponse(chunks)
+
+    source = StreamingResponseSource(response, encoding=None)
+    loop = asyncio.get_running_loop()
+
+    await source.start_producer(loop)
+
+    def consume():
+        result = []
+        for chunk in source.gen:
+            result.append(chunk)
+        return result
+
+    result = await loop.run_in_executor(None, consume)
+
+    assert result == chunks
+    assert b"".join(result) == b"hello world!"
+
+
+@pytest.mark.asyncio
+async def test_streaming_with_gzip_compression():
+    """Test streaming with gzip decompression."""
+    original_data = b"hello world! " * 1000
+    compressed = gzip.compress(original_data)
+    chunk_size = 100
+    chunks = [compressed[i : i + chunk_size] for i in range(0, len(compressed), chunk_size)]
+
+    response = MockResponse(chunks, encoding="gzip")
+    source = StreamingResponseSource(response, encoding="gzip")
+    loop = asyncio.get_running_loop()
+
+    await source.start_producer(loop)
+
+    def consume():
+        result = []
+        for chunk in source.gen:
+            result.append(chunk)
+        return b"".join(result)
+
+    decompressed = await loop.run_in_executor(None, consume)
+
+    assert decompressed == original_data
+
+
+@pytest.mark.asyncio
+async def test_streaming_with_deflate_compression():
+    """Test streaming with deflate decompression."""
+    original_data = b"test data " * 500
+    compressed = zlib.compress(original_data)
+
+    chunks = [compressed[i : i + 50] for i in range(0, len(compressed), 50)]
+
+    response = MockResponse(chunks, encoding="deflate")
+    source = StreamingResponseSource(response, encoding="deflate")
+    loop = asyncio.get_running_loop()
+
+    await source.start_producer(loop)
+
+    def consume():
+        result = []
+        for chunk in source.gen:
+            result.append(chunk)
+        return b"".join(result)
+
+    decompressed = await loop.run_in_executor(None, consume)
+
+    assert decompressed == original_data
+
+
+@pytest.mark.asyncio
+async def test_streaming_with_zstd_compression():
+    """Test streaming with zstd decompression."""
+    original_data = b"zstd test data " * 500
+    compressed = _zstd_compress(original_data)
+
+    chunks = [compressed[i : i + 50] for i in range(0, len(compressed), 50)]
+
+    response = MockResponse(chunks, encoding="zstd")
+    source = StreamingResponseSource(response, encoding="zstd")
+    loop = asyncio.get_running_loop()
+
+    await source.start_producer(loop)
+
+    def consume():
+        result = []
+        for chunk in source.gen:
+            result.append(chunk)
+        return b"".join(result)
+
+    decompressed = await loop.run_in_executor(None, consume)
+
+    assert decompressed == original_data
+
+
+@pytest.mark.asyncio
+async def test_streaming_with_lz4_compression():
+    """Test streaming with lz4 decompression."""
+    original_data = b"lz4 test data " * 500
+    compressed = lz4.frame.compress(original_data)
+
+    chunks = [compressed[i : i + 50] for i in range(0, len(compressed), 50)]
+
+    response = MockResponse(chunks, encoding="lz4")
+    source = StreamingResponseSource(response, encoding="lz4")
+    loop = asyncio.get_running_loop()
+
+    await source.start_producer(loop)
+
+    def consume():
+        result = []
+        for chunk in source.gen:
+            result.append(chunk)
+        return b"".join(result)
+
+    decompressed = await loop.run_in_executor(None, consume)
+
+    assert decompressed == original_data
+
+
+@pytest.mark.asyncio
+async def test_empty_stream():
+    """Test streaming with empty response."""
+    response = MockResponse([])
+    source = StreamingResponseSource(response, encoding=None)
+    loop = asyncio.get_running_loop()
+
+    await source.start_producer(loop)
+
+    def consume():
+        result = []
+        for chunk in source.gen:
+            result.append(chunk)
+        return result
+
+    result = await loop.run_in_executor(None, consume)
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_single_large_chunk():
+    """Test streaming with single large chunk."""
+    large_chunk = b"x" * 1000000
+    response = MockResponse([large_chunk])
+    source = StreamingResponseSource(response, encoding=None)
+    loop = asyncio.get_running_loop()
+
+    await source.start_producer(loop)
+
+    def consume():
+        result = []
+        for chunk in source.gen:
+            result.append(chunk)
+        return result
+
+    result = await loop.run_in_executor(None, consume)
+
+    assert len(result) == 1
+    assert result[0] == large_chunk
+
+
+@pytest.mark.asyncio
+async def test_many_small_chunks():
+    """Test streaming with many small chunks."""
+    chunks = [f"chunk{i}".encode() for i in range(1000)]
+    response = MockResponse(chunks)
+    source = StreamingResponseSource(response, encoding=None)
+    loop = asyncio.get_running_loop()
+
+    await source.start_producer(loop)
+
+    def consume():
+        result = []
+        for chunk in source.gen:
+            result.append(chunk)
+        return result
+
+    result = await loop.run_in_executor(None, consume)
+
+    assert len(result) == 1000
+    assert result == chunks
+
+
+@pytest.mark.asyncio
+async def test_generator_caching():
+    """Test that .gen property returns cached generator."""
+    response = MockResponse([b"test"])
+    source = StreamingResponseSource(response, encoding=None)
+    loop = asyncio.get_running_loop()
+
+    await source.start_producer(loop)
+
+    # Access .gen multiple times - should return same generator
+    gen1 = source.gen
+    gen2 = source.gen
+
+    assert gen1 is gen2, "Generator should be cached"
+
+
+@pytest.mark.asyncio
+async def test_producer_error_propagation():
+    """Test that producer errors are propagated to consumer."""
+
+    class FailingContent:
+        @staticmethod
+        async def read(n=-1):
+            raise ValueError("Producer error!")
+
+    response = Mock()
+    response.content = FailingContent()
+    response.headers = {}
+    response.closed = False
+
+    source = StreamingResponseSource(response, encoding=None)
+    loop = asyncio.get_running_loop()
+
+    await source.start_producer(loop)
+
+    def consume():
+        try:
+            for _ in source.gen:
+                pass
+        except OperationalError as e:
+            return str(e)
+        return "No error raised!"
+
+    error_msg = await loop.run_in_executor(None, consume)
+
+    assert error_msg == "Failed to read response data from server"
+
+
+@pytest.mark.asyncio
+async def test_gzip_with_incremental_decompression():
+    """Test that gzip decompression works incrementally with streaming."""
+    original_data = b"The quick brown fox jumps over the lazy dog. " * 100
+    compressed = gzip.compress(original_data)
+
+    # Split compressed data into very small chunks to force incremental decompression
+    chunks = [compressed[i : i + 10] for i in range(0, len(compressed), 10)]
+
+    response = MockResponse(chunks, encoding="gzip")
+    source = StreamingResponseSource(response, encoding="gzip")
+    loop = asyncio.get_running_loop()
+
+    await source.start_producer(loop)
+
+    def consume():
+        """Consume and verify we get multiple decompressed chunks."""
+        chunks_received = []
+        for chunk in source.gen:
+            chunks_received.append(chunk)
+        return chunks_received, b"".join(chunks_received)
+
+    chunks_received, decompressed = await loop.run_in_executor(None, consume)
+
+    assert decompressed == original_data
+    assert len([c for c in chunks_received if c]) > 0
+
+
+@pytest.mark.asyncio
+async def test_backpressure_with_bounded_queue():
+    """Test that bounded queue provides backpressure."""
+    # Create many chunks to test backpressure
+    chunks = [f"chunk{i}".encode() for i in range(100)]
+    response = MockResponse(chunks)
+
+    source = StreamingResponseSource(response, encoding=None)
+    loop = asyncio.get_running_loop()
+
+    await source.start_producer(loop)
+
+    # Slow consumer
+    def slow_consume():
+        result = []
+        for chunk in source.gen:
+            time.sleep(0.001)
+            result.append(chunk)
+        return result
+
+    result = await loop.run_in_executor(None, slow_consume)
+
+    # All chunks should still be received despite slow consumer
+    assert len(result) == 100
+    assert result == chunks
+
+
+@pytest.mark.asyncio
+async def test_sync_close_runs_on_event_loop_thread():
+    """close() from an executor thread runs response teardown on the loop thread."""
+    loop_thread = threading.current_thread()
+    close_thread = None
+
+    class StalledContent:
+        @staticmethod
+        async def read(n=-1):
+            await asyncio.sleep(3600)
+
+    class StalledResponse:
+        def __init__(self):
+            self.content = StalledContent()
+            self.headers = {}
+            self.closed = False
+
+        def close(self):
+            nonlocal close_thread
+            close_thread = threading.current_thread()
+            self.closed = True
+
+    response = StalledResponse()
+
+    source = StreamingResponseSource(response, encoding=None)
+    loop = asyncio.get_running_loop()
+    await source.start_producer(loop)
+
+    await loop.run_in_executor(None, source.close)
+
+    for _ in range(100):
+        if response.closed:
+            break
+        await asyncio.sleep(0.01)
+
+    assert response.closed
+    assert close_thread is loop_thread
+
+    if source._producer_task is not None:
+        try:
+            await source._producer_task
+        except asyncio.CancelledError:
+            pass
+
+
+class MockTransform:
+    """Mock NativeTransform."""
+
+    def __init__(self, chunks=None):
+        self.chunks = chunks or [b"chunk1", b"chunk2"]
+
+    def build_insert(self, context):
+        yield from self.chunks
+
+
+class FailingTransform:
+    """Mock NativeTransform that raises error."""
+
+    @staticmethod
+    def build_insert(context):
+        yield b"chunk1"
+        raise ValueError("Serialization error")
+
+
+class MockContext:
+    """Mock InsertContext."""
+
+
+@pytest.mark.asyncio
+async def test_streaming_insert_basic():
+    """Test basic streaming insert (reverse bridge)."""
+    transform = MockTransform()
+    context = MockContext()
+    loop = asyncio.get_running_loop()
+
+    source = StreamingInsertSource(transform, context, loop)
+    source.start_producer()
+
+    chunks = []
+    async for chunk in source.async_generator():
+        chunks.append(chunk)
+
+    await source.close()
+
+    assert chunks == [b"chunk1", b"chunk2"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_insert_error_propagation():
+    """Test that insert producer errors are propagated to async consumer."""
+    transform = FailingTransform()
+    context = MockContext()
+    loop = asyncio.get_running_loop()
+
+    source = StreamingInsertSource(transform, context, loop)
+    source.start_producer()
+
+    chunks = []
+    with pytest.raises(ValueError, match="Serialization error"):
+        async for chunk in source.async_generator():
+            chunks.append(chunk)
+
+    await source.close()
+
+    # Should have received first chunk before error
+    assert chunks == [b"chunk1"]
+    assert isinstance(context.insert_exception, ValueError)
+    assert str(context.insert_exception) == "Serialization error"
+
+
+def test_sync_streaming_insert_error_propagation():
+    """Test that insert producer errors are propagated to sync consumer."""
+    transform = FailingTransform()
+    context = MockContext()
+
+    source = _SyncStreamingInsertSource(transform, context)
+    source.start_producer()
+
+    chunks = []
+    with pytest.raises(ValueError, match="Serialization error"):
+        for chunk in source.gen:
+            chunks.append(chunk)
+
+    assert isinstance(context.insert_exception, ValueError)
+
+    assert chunks == [b"chunk1"]
+
+
+class RefusingTransform:
+    """Mock transform whose build_insert raises a deterministic driver refusal at call time."""
+
+    @staticmethod
+    def build_insert(context):
+        raise NotSupportedError("strict refusal")
+
+
+def _streaming_error_records(caplog):
+    records = [r for r in caplog.records if r.name == "clickhouse_connect.driver.streaming"]
+    return [r for r in records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.asyncio
+async def test_streaming_insert_driver_error_logs_debug(caplog):
+    """Deterministic driver refusals propagate without ERROR-level noise."""
+    context = MockContext()
+    loop = asyncio.get_running_loop()
+
+    source = StreamingInsertSource(RefusingTransform(), context, loop)
+    with caplog.at_level(logging.DEBUG, logger="clickhouse_connect.driver.streaming"):
+        source.start_producer()
+        with pytest.raises(NotSupportedError, match="strict refusal"):
+            async for _chunk in source.async_generator():
+                pass
+    await source.close()
+
+    assert isinstance(context.insert_exception, NotSupportedError)
+    assert not _streaming_error_records(caplog)
+    assert any("Insert producer error" in r.getMessage() for r in caplog.records)
+
+
+def test_sync_streaming_insert_driver_error_logs_debug(caplog):
+    """Deterministic driver refusals propagate without ERROR-level noise."""
+    context = MockContext()
+
+    source = _SyncStreamingInsertSource(RefusingTransform(), context)
+    with caplog.at_level(logging.DEBUG, logger="clickhouse_connect.driver.streaming"):
+        source.start_producer()
+        with pytest.raises(NotSupportedError, match="strict refusal"):
+            for _chunk in source.gen:
+                pass
+
+    assert isinstance(context.insert_exception, NotSupportedError)
+    assert not _streaming_error_records(caplog)
+    assert any("Insert producer error" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_streaming_insert_backpressure():
+    """Test backpressure in streaming insert."""
+    chunks = [f"chunk{i}".encode() for i in range(100)]
+    transform = MockTransform(chunks)
+    context = MockContext()
+    loop = asyncio.get_running_loop()
+
+    # Small queue size to force backpressure
+    source = StreamingInsertSource(transform, context, loop, maxsize=2)
+    source.start_producer()
+
+    received = []
+    async for chunk in source.async_generator():
+        received.append(chunk)
+        # Yield to allow producer to run (since we're in same loop/process)
+        await asyncio.sleep(0.001)
+
+    await source.close()
+
+    assert len(received) == 100
+    assert received == chunks
+
+
+class MockByteSource:
+    """Mock ByteSource for ReadAheadSource tests."""
+
+    def __init__(self, chunks, exception_tag=None, error=None):
+        self._chunks = list(chunks)
+        self._error = error
+        self.exception_tag = exception_tag
+        self.closed = False
+
+    @property
+    def gen(self):
+        yield from self._chunks
+        if self._error is not None:
+            raise self._error
+
+    def close(self):
+        self.closed = True
+
+
+class ReadBlockedByteSource:
+    def __init__(self, early_chunks=(b"early_1", b"early_2")):
+        self.early_chunks = early_chunks
+        self.read_started = threading.Event()
+        self.release_read = threading.Event()
+        self.closed = False
+        self.close_thread_id = None
+
+    @property
+    def gen(self):
+        # By default, two immediate chunks start the producer before the third read blocks.
+        yield from self.early_chunks
+        self.read_started.set()
+        self.release_read.wait(timeout=5.0)
+        yield b"late"
+
+    def close(self):
+        self.close_thread_id = threading.get_ident()
+        self.closed = True
+        self.release_read.set()
+
+
+class RejectingLoop:
+    def call_soon_threadsafe(self, _callback, *_args):
+        raise RuntimeError("loop closed")
+
+
+def test_read_ahead_chunk_order():
+    src = MockByteSource([b"a", b"b", b"c"])
+    read_source = ReadAheadSource(src)
+    assert list(read_source.gen) == [b"a", b"b", b"c"]
+    assert read_source._thread is not None
+    read_source.close()
+    assert read_source._thread.is_alive() is False
+    assert src.closed is True
+
+
+def test_read_ahead_gen_cached():
+    read_source = ReadAheadSource(MockByteSource([b"a"]))
+    assert read_source.gen is read_source.gen
+    read_source.close()
+
+
+def test_read_ahead_first_chunk_does_not_wait_for_second():
+    src = ReadBlockedByteSource(early_chunks=(b"early_1",))
+    read_source = ReadAheadSource(src)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(next, read_source.gen)
+        try:
+            assert first.result(timeout=1.0) == b"early_1"
+            assert read_source._thread is None
+            assert not src.read_started.is_set()
+        finally:
+            src.release_read.set()
+            first.result(timeout=1.0)
+            read_source.close()
+    assert list(read_source.gen) == []
+    assert not src.read_started.is_set()
+
+
+def test_read_ahead_error_forwarded_verbatim():
+    err = ValueError("boom")
+    src = MockByteSource([b"a", b"b"], error=err)
+    read_source = ReadAheadSource(src)
+    collected = []
+    with pytest.raises(ValueError, match="boom") as excinfo:
+        for chunk in read_source.gen:
+            collected.append(chunk)
+    assert collected == [b"a", b"b"]  # forwarded in stream order, error last
+    assert excinfo.value is err  # verbatim, not re-wrapped
+    read_source.close()
+
+
+def test_read_ahead_tagged_exception_chunk_unchanged():
+    # exception_tag is delegated and the chunk passes through verbatim so the codec scanner can find it.
+    src = MockByteSource([b"prefix __exception__T\r\nboom\r\n"], exception_tag="T")
+    read_source = ReadAheadSource(src)
+    assert read_source.exception_tag == "T"
+    assert list(read_source.gen) == [b"prefix __exception__T\r\nboom\r\n"]
+    read_source.close()
+
+
+def test_read_ahead_close_during_block_terminates_thread():
+    # A large producer fills the bounded queue while the consumer reads nothing, so the producer blocks in _put.
+    src = MockByteSource([bytes([i % 256]) for i in range(500)])
+    read_source = ReadAheadSource(src, maxsize=2)
+    assert next(read_source.gen) == b"\x00"
+    assert next(read_source.gen) == b"\x01"
+    read_source.close()
+    assert src.closed is True
+    assert read_source._thread.is_alive() is False
+
+
+@pytest.mark.parametrize("chunks", [[], [b"a"], [b"a", b"b", b"c"]])
+def test_read_ahead_close_before_consumption_never_starts_thread(chunks):
+    src = MockByteSource(chunks)
+    read_source = ReadAheadSource(src)
+    consumer = read_source.gen
+    read_source.close()
+    assert src.closed is True
+    assert list(consumer) == []
+    assert read_source._thread is None
+
+    closed = ReadAheadSource(MockByteSource([b"a"]))
+    closed.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = closed.gen
+
+
+@pytest.mark.parametrize("chunks_consumed", [1, 2])
+def test_read_ahead_abandoned_source_is_collected(chunks_consumed):
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    read_source_ref = None
+    try:
+        src = MockByteSource([bytes([i % 256]) for i in range(500)])
+        read_source = ReadAheadSource(src, maxsize=2)
+        read_source_ref = weakref.ref(read_source)
+
+        for i in range(chunks_consumed):
+            assert next(read_source.gen) == bytes([i])
+        thread = read_source._thread
+        assert (thread is not None) is (chunks_consumed == 2)
+        if thread is not None:
+            deadline = time.time() + 1.0
+            while time.time() < deadline and not read_source.queue.full():
+                time.sleep(0.01)
+            assert read_source.queue.full()
+
+        del read_source
+        if thread is not None:
+            thread.join(timeout=1.0)
+            assert thread.is_alive() is False
+        assert read_source_ref() is None
+        assert src.closed is True
+    finally:
+        if read_source_ref is not None:
+            leaked_source = read_source_ref()
+            if leaked_source is not None:
+                leaked_source.close()
+        if gc_was_enabled:
+            gc.enable()
+
+
+@pytest.mark.asyncio
+async def test_read_ahead_abandoned_source_does_not_block_event_loop():
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    read_source_ref = None
+    source = ReadBlockedByteSource()
+    thread = None
+    try:
+        read_source = ReadAheadSource(source)
+        read_source_ref = weakref.ref(read_source)
+        assert next(read_source.gen) == b"early_1"
+        assert next(read_source.gen) == b"early_2"
+        thread = read_source._thread
+        assert await asyncio.to_thread(source.read_started.wait, 1.0)
+
+        loop = asyncio.get_running_loop()
+        loop_thread_id = threading.get_ident()
+        loop_ticked = asyncio.Event()
+        loop.call_soon(loop_ticked.set)
+        started = time.monotonic()
+        del read_source
+
+        await asyncio.wait_for(loop_ticked.wait(), timeout=0.5)
+        assert time.monotonic() - started < 0.5
+        assert read_source_ref() is None
+
+        deadline = loop.time() + 2.0
+        while loop.time() < deadline and not source.closed:
+            await asyncio.sleep(0.01)
+        assert source.closed is True
+        assert source.close_thread_id == loop_thread_id
+        await asyncio.to_thread(thread.join, 1.0)
+        assert thread.is_alive() is False
+    finally:
+        if read_source_ref is not None:
+            leaked_source = read_source_ref()
+            if leaked_source is not None:
+                leaked_source.close()
+        source.release_read.set()
+        if thread is not None:
+            await asyncio.to_thread(thread.join, 1.0)
+        if gc_was_enabled:
+            gc.enable()
+
+
+def test_read_ahead_finalizer_releases_source_when_loop_scheduling_fails():
+    src = MockByteSource([bytes([i % 256]) for i in range(500)])
+    read_source = ReadAheadSource(src, maxsize=2)
+    assert next(read_source.gen) == b"\x00"
+    assert next(read_source.gen) == b"\x01"
+    read_source._stop_event.set()
+    source, read_source.source = read_source.source, None
+    assert source is not None
+
+    _finalize_read_ahead_off_loop(RejectingLoop(), source, read_source.queue, read_source._thread)
+
+    assert read_source._thread.is_alive() is False
+    assert src.closed is True
+
+
+@pytest.mark.parametrize("chunks", [[], [b"only"]])
+def test_read_ahead_short_stream_no_thread(chunks):
+    src = MockByteSource(chunks)
+    read_source = ReadAheadSource(src)
+    assert list(read_source.gen) == chunks
+    assert read_source._thread is None
+    read_source.close()
+    assert src.closed is True
+
+
+@pytest.mark.parametrize("chunk_count", [0, 1, 2, 3])
+def test_read_ahead_error_at_any_position_forwarded_verbatim(chunk_count):
+    # Errors before the handoff propagate directly from the consuming thread, later ones through the queue.
+    err = ValueError("boom")
+    chunks = [bytes([i]) for i in range(chunk_count)]
+    src = MockByteSource(chunks, error=err)
+    read_source = ReadAheadSource(src)
+    collected = []
+    with pytest.raises(ValueError, match="boom") as excinfo:
+        for chunk in read_source.gen:
+            collected.append(chunk)
+    assert collected == chunks
+    assert excinfo.value is err
+    assert (read_source._thread is not None) is (chunk_count >= 2)
+    read_source.close()
+    assert src.closed is True
+
+
+@pytest.mark.asyncio
+async def test_read_ahead_aclose_after_multi_chunk_stream():
+    src = MockByteSource([b"a", b"b", b"c", b"d"])
+    read_source = ReadAheadSource(src, maxsize=2)
+    assert await asyncio.to_thread(list, read_source.gen) == [b"a", b"b", b"c", b"d"]
+    thread = read_source._thread
+    assert thread is not None
+    await read_source.aclose()
+    assert thread.is_alive() is False
+    assert src.closed is True
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

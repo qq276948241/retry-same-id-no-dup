@@ -1,0 +1,1867 @@
+import logging
+import sys
+import zoneinfo
+from datetime import timezone
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
+import aiohttp
+import pytest
+from urllib3.exceptions import HTTPError
+
+from clickhouse_connect import common
+from clickhouse_connect.driver import create_async_client, create_client, rustcodec
+from clickhouse_connect.driver._backend.http_sync import HttpSyncBackend
+from clickhouse_connect.driver._backend.httpcommon import plan_data_insert_request
+from clickhouse_connect.driver.asyncclient import AsyncClient
+from clickhouse_connect.driver.binding import _query_is_insert, _strip_trailing_semicolons
+from clickhouse_connect.driver.client import Client
+from clickhouse_connect.driver.exceptions import DatabaseError, OperationalError, ProgrammingError
+from clickhouse_connect.driver.external import ExternalData
+from clickhouse_connect.driver.httpclient import HttpClient, ex_header
+from clickhouse_connect.driver.query import QueryContext
+
+
+# Helper function to create mock response
+def create_mock_response(status=500, headers=None, data=None):
+    """Create a mock HTTP response with the specified attributes"""
+    response = Mock()
+    response.status = status
+    response.headers = headers or {}
+    response.data = data or b""
+    response.close = Mock()  # Mock the close method
+    return response
+
+
+class TestHttpClientHeaders:
+    """Test client-level HTTP header configuration."""
+
+    def test_headers_are_available_during_initialization(self):
+        init_headers = {}
+
+        def capture_headers(client, _tz_source):
+            init_headers.update(client.headers)
+
+        with patch.object(Client, "_init_common_settings", autospec=True, side_effect=capture_headers):
+            HttpClient(
+                interface="http",
+                host="localhost",
+                port=8123,
+                username="default",
+                password="",
+                database="default",
+                headers={
+                    "CF-Access-Client-Id": "test_client_id",
+                    "CF-Access-Client-Secret": "test_client_secret",
+                },
+            )
+
+        assert init_headers["CF-Access-Client-Id"] == "test_client_id"
+        assert init_headers["CF-Access-Client-Secret"] == "test_client_secret"
+        assert "Authorization" in init_headers
+        assert "User-Agent" in init_headers
+
+    def test_request_headers_override_client_headers(self):
+        response = create_mock_response(status=200)
+        pool_mgr = Mock()
+        pool_mgr.request.return_value = response
+
+        with patch.object(Client, "_init_common_settings", autospec=True):
+            client = HttpClient(
+                interface="http",
+                host="localhost",
+                port=8123,
+                username="default",
+                password="",
+                database="default",
+                pool_mgr=pool_mgr,
+                headers={"X-Trace": "client", "X-Gateway": "cloudflare"},
+            )
+
+        client._raw_request(b"", {}, headers={"X-Trace": "request"})
+
+        request_headers = pool_mgr.request.call_args.kwargs["headers"]
+        assert request_headers["X-Trace"] == "request"
+        assert request_headers["X-Gateway"] == "cloudflare"
+        assert request_headers["Authorization"] == client.headers["Authorization"]
+        assert request_headers["User-Agent"] == client.headers["User-Agent"]
+
+    def test_ping_uses_client_headers(self):
+        response = create_mock_response(status=200)
+        pool_mgr = Mock()
+        pool_mgr.request.return_value = response
+
+        with patch.object(Client, "_init_common_settings", autospec=True):
+            client = HttpClient(
+                interface="http",
+                host="localhost",
+                port=8123,
+                username="default",
+                password="",
+                database="default",
+                pool_mgr=pool_mgr,
+                server_host_name="clickhouse.example.com",
+                headers={"X-Gateway": "cloudflare"},
+            )
+
+        assert client.ping() is True
+
+        request_headers = pool_mgr.request.call_args.kwargs["headers"]
+        assert request_headers["X-Gateway"] == "cloudflare"
+        assert request_headers["Authorization"] == client.headers["Authorization"]
+        assert request_headers["User-Agent"] == client.headers["User-Agent"]
+        assert request_headers["Host"] == "clickhouse.example.com"
+        assert pool_mgr.request.call_args.kwargs["assert_same_host"] is False
+
+    def test_dsn_headers_query_param_must_be_dict(self):
+        with pytest.raises(ProgrammingError, match="headers must be a dictionary"):
+            create_client(dsn="http://localhost:8123/default?headers=not_a_dict")
+
+    def test_explicit_headers_override_dsn_headers_query_param(self):
+        init_headers = {}
+
+        def capture_headers(client, _tz_source):
+            init_headers.update(client.headers)
+
+        with patch.object(Client, "_init_common_settings", autospec=True, side_effect=capture_headers):
+            create_client(
+                dsn="http://localhost:8123/default?headers=not_a_dict",
+                headers={"X-Gateway": "cloudflare"},
+            )
+
+        assert init_headers["X-Gateway"] == "cloudflare"
+
+
+class TestAsyncClientHeaders:
+    """Test async client-level HTTP header configuration."""
+
+    @pytest.mark.asyncio
+    async def test_request_headers_override_client_headers(self):
+        client = AsyncClient(
+            interface="http",
+            host="localhost",
+            port=8123,
+            username="default",
+            password="",
+            database="default",
+            headers={"X-Trace": "client", "X-Gateway": "cloudflare"},
+        )
+        session = Mock()
+        session.closed = False
+        response = Mock()
+        response.status = 200
+        response.headers = {}
+        session.request = AsyncMock(return_value=response)
+        client._session = session
+
+        await client._raw_request(None, {}, headers={"X-Trace": "request"})
+
+        request_headers = session.request.call_args.kwargs["headers"]
+        assert request_headers["X-Trace"] == "request"
+        assert request_headers["X-Gateway"] == "cloudflare"
+        assert request_headers["Authorization"] == client.headers["Authorization"]
+        assert request_headers["User-Agent"] == client.headers["User-Agent"]
+        assert request_headers["Accept-Encoding"] == client.headers["Accept-Encoding"]
+
+    @pytest.mark.asyncio
+    async def test_dsn_headers_query_param_must_be_dict(self):
+        with pytest.raises(ProgrammingError, match="headers must be a dictionary"):
+            await create_async_client(dsn="http://localhost:8123/default?headers=not_a_dict")
+
+    @pytest.mark.asyncio
+    async def test_explicit_headers_override_dsn_headers_query_param(self):
+        with patch.object(AsyncClient, "_initialize", new=AsyncMock()):
+            client = await create_async_client(
+                dsn="http://localhost:8123/default?headers=not_a_dict",
+                headers={"X-Gateway": "cloudflare"},
+            )
+
+        assert client.headers["X-Gateway"] == "cloudflare"
+
+
+class _CompatibleCore:
+    """Stand-in for the compiled module with a compatible binding API."""
+
+    __version__ = "0.1.0"
+    BINDING_API_VERSION = rustcodec.REQUIRED_BINDING_API_VERSION
+
+
+class TestNativeCodecIntegrationTag:
+    @pytest.mark.parametrize(("codec", "tagged"), [("rust", True), ("rust_strict", True), ("python", False)])
+    def test_sync_client_user_agent(self, monkeypatch, codec, tagged):
+        monkeypatch.setitem(sys.modules, "_ch_core", _CompatibleCore)
+        with patch.object(Client, "_init_common_settings", autospec=True):
+            client = HttpClient(
+                interface="http",
+                host="localhost",
+                port=8123,
+                username="default",
+                password="",
+                database="default",
+                native_codec=codec,
+            )
+
+        assert ("clickhouse-connect-core/" in client.headers["User-Agent"]) is tagged
+
+    @pytest.mark.parametrize(("codec", "tagged"), [("rust", True), ("rust_strict", True), ("python", False)])
+    def test_async_client_user_agent(self, monkeypatch, codec, tagged):
+        monkeypatch.setitem(sys.modules, "_ch_core", _CompatibleCore)
+        client = AsyncClient(
+            interface="http",
+            host="localhost",
+            port=8123,
+            username="default",
+            password="",
+            database="default",
+            native_codec=codec,
+        )
+
+        assert ("clickhouse-connect-core/" in client.headers["User-Agent"]) is tagged
+
+
+class _MockInsertContext:
+    def __init__(self, transport_settings):
+        self.empty = False
+        self.compression = False
+        self.settings = {}
+        self.transport_settings = transport_settings
+        self.insert_exception = None
+        self.data = [(13,)]
+        self.current_row = 0
+        self.current_block = 0
+
+
+class _FakeInsertTransform:
+    threaded_insert = True
+
+    def build_insert(self, context):
+        yield b"body"
+
+
+class TestHttpClientInsert:
+    def test_rust_retry_closes_active_source_before_rewind(self):
+        context = _MockInsertContext({})
+        close_events = []
+        init_events = []
+
+        class TrackingSource:
+            instances = 0
+
+            def __init__(self, transform, context, maxsize=10):
+                TrackingSource.instances += 1
+                self.index = TrackingSource.instances
+                self.context = context
+                self.gen = iter([b"rust"])
+                init_events.append((self.index, context.current_row, context.current_block))
+
+            def start_producer(self):
+                self.context.current_row = 13
+                self.context.current_block = 1
+
+            def close(self, timeout=1.0):
+                close_events.append((self.index, timeout, self.context.current_row, self.context.current_block))
+
+        class FakeBackend:
+            def execute_data_insert(self, context, runtime, body, retry_body):
+                rebuilt = retry_body()
+                assert list(rebuilt) == [b"rust"]
+                return {}
+
+        client = object.__new__(HttpClient)
+        client.database = None
+        client.write_compression = None
+        client._transform = _FakeInsertTransform()
+        client._validate_settings = Mock(return_value={})
+        client._backend = FakeBackend()
+
+        with patch("clickhouse_connect.driver._backendclient._SyncStreamingInsertSource", TrackingSource):
+            client.data_insert(context)
+
+        assert init_events == [(1, 0, 0), (2, 0, 0)]
+        assert close_events[0] == (1, None, 13, 1)
+        assert close_events[-1] == (2, 1.0, 13, 1)
+        assert context.data is None
+
+
+class TestAsyncClientInsert:
+    @pytest.mark.asyncio
+    async def test_data_insert_passes_transport_settings_as_headers(self):
+        client = AsyncClient(
+            interface="http",
+            host="localhost",
+            port=8123,
+            username="default",
+            password="",
+            database="default",
+        )
+        client._transform = _FakeInsertTransform()
+        context = _MockInsertContext({"X-Trace": "user_1"})
+        captured = {}
+
+        async def execute_data_insert(context, runtime, body, retry_body):
+            plan = plan_data_insert_request(context, runtime)
+            data = bytearray()
+            async for chunk in body:
+                data += chunk
+            captured["body"] = bytes(data)
+            captured["headers"] = plan.headers
+            return {}
+
+        client._backend = Mock()
+        client._backend.execute_data_insert = execute_data_insert
+
+        await client.data_insert(context)
+
+        assert captured["body"] == b"body"
+        assert captured["headers"]["X-Trace"] == "user_1"
+        assert context.data is None
+
+
+class TestConstructorAuthHeaders:
+    """Mutual TLS headers and a bearer token coexist (the sync convention,
+    converged): cert headers are set independently, the token wins over basic."""
+
+    def test_sync_mutual_tls_with_access_token_sends_both(self):
+        with patch.object(Client, "_init_common_settings", autospec=True):
+            client = HttpClient(
+                interface="https",
+                host="localhost",
+                port=8443,
+                username="cert_user",
+                password="",
+                database="default",
+                access_token="tok",
+                client_cert="client.pem",
+                pool_mgr=Mock(),
+            )
+        assert client.headers["X-ClickHouse-User"] == "cert_user"
+        assert client.headers["X-ClickHouse-SSL-Certificate-Auth"] == "on"
+        assert client.headers["Authorization"] == "Bearer tok"
+
+    def test_async_mutual_tls_with_access_token_sends_both(self):
+        client = AsyncClient(
+            interface="http",
+            host="localhost",
+            port=8123,
+            username="cert_user",
+            password="",
+            database="default",
+            access_token="tok",
+            client_cert="client.pem",
+        )
+        assert client.headers["X-ClickHouse-User"] == "cert_user"
+        assert client.headers["X-ClickHouse-SSL-Certificate-Auth"] == "on"
+        assert client.headers["Authorization"] == "Bearer tok"
+
+    def test_async_mutual_tls_without_token_sends_no_authorization(self):
+        client = AsyncClient(
+            interface="http",
+            host="localhost",
+            port=8123,
+            username="cert_user",
+            password="secret",
+            database="default",
+            client_cert="client.pem",
+        )
+        assert client.headers["X-ClickHouse-SSL-Certificate-Auth"] == "on"
+        assert "Authorization" not in client.headers
+
+
+class TestAsyncClientErrorHandler:
+    """Test the error handling functionality of AsyncClient"""
+
+    @staticmethod
+    def make_client():
+        client = AsyncClient(
+            interface="http",
+            host="localhost",
+            port=8123,
+            username="default",
+            password="",
+            database="default",
+        )
+        client.url = "http://localhost:8123"
+        client.show_clickhouse_errors = True
+        return client
+
+    @staticmethod
+    def make_response(status=500, headers=None, data=b""):
+        response = Mock()
+        response.status = status
+        response.headers = headers or {}
+        response.read = AsyncMock(return_value=data)
+        response.close = Mock()
+        return response
+
+    @pytest.mark.asyncio
+    async def test_error_handler_sets_structured_code_and_name(self):
+        client = self.make_client()
+        response = self.make_response(
+            status=404,
+            headers={ex_header: "60"},
+            data=b"Code: 60. DB::Exception: Unknown table 'x'. (UNKNOWN_TABLE) (version 26.2.4.23)",
+        )
+
+        with pytest.raises(DatabaseError) as excinfo:
+            await client._error_handler(response)
+
+        assert excinfo.value.code == 60
+        assert excinfo.value.name == "UNKNOWN_TABLE"
+        assert "server response:" in str(excinfo.value)
+        response.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_error_handler_code_set_when_errors_disabled(self):
+        client = self.make_client()
+        client.show_clickhouse_errors = False
+        response = self.make_response(
+            status=404,
+            headers={ex_header: "60"},
+            data=b"Code: 60. DB::Exception: Unknown table 'x'. (UNKNOWN_TABLE)",
+        )
+
+        with pytest.raises(DatabaseError) as excinfo:
+            await client._error_handler(response)
+
+        assert excinfo.value.code == 60
+        assert excinfo.value.name is None
+        assert "UNKNOWN_TABLE" not in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_error_handler_with_scrub_mode(self):
+        client = self.make_client()
+        client.show_clickhouse_errors = "scrub"
+        response = self.make_response(
+            status=404,
+            headers={ex_header: "60"},
+            data=(b"Code: 60. DB::Exception: Unknown table 'x'. (UNKNOWN_TABLE) (version 26.2.4.23 (official build))"),
+        )
+
+        with pytest.raises(DatabaseError) as excinfo:
+            await client._error_handler(response)
+
+        error_msg = str(excinfo.value)
+        assert "Received ClickHouse exception, code: 60" in error_msg
+        assert "Unknown table 'x'" in error_msg
+        assert "(UNKNOWN_TABLE)" in error_msg
+        assert "version" not in error_msg
+        assert "official build" not in error_msg
+        assert client.url not in error_msg
+        assert "(for url" not in error_msg
+        assert excinfo.value.code == 60
+        assert excinfo.value.name == "UNKNOWN_TABLE"
+        response.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_error_handler_retried_raises_operational_error(self):
+        client = self.make_client()
+        response = self.make_response(status=503, headers={ex_header: "159"}, data=b"timeout")
+
+        with pytest.raises(OperationalError) as excinfo:
+            await client._error_handler(response, retried=True)
+
+        assert excinfo.value.code == 159
+
+    @pytest.mark.asyncio
+    async def test_transport_error_scrub_mode_is_generic(self, caplog):
+        client = self.make_client()
+        client.show_clickhouse_errors = "scrub"
+        error = aiohttp.ClientConnectionError("Cannot connect to host localhost:8123/?token=secret")
+        session = Mock()
+        session.closed = False
+        session.request = AsyncMock(side_effect=error)
+        client._session = session
+
+        with caplog.at_level(logging.WARNING), pytest.raises(OperationalError) as excinfo:
+            await client._raw_request(None, {"query": "SELECT 13"})
+
+        assert str(excinfo.value) == "Network Error"
+        assert excinfo.value.__cause__ is error
+        assert "localhost" not in str(excinfo.value)
+        assert "secret" not in str(excinfo.value)
+        assert any(record.levelno == logging.WARNING and "aiohttp connection error" in record.message for record in caplog.records)
+
+    def test_show_clickhouse_errors_setter_rejects_invalid(self):
+        client = self.make_client()
+        with pytest.raises(ProgrammingError, match="show_clickhouse_errors"):
+            client.show_clickhouse_errors = "redact"
+
+
+class TestHttpClientErrorHandler:
+    """Test the error handling functionality of HttpClient"""
+
+    def setup_method(self):
+        """Set up common test fixtures"""
+        # Create a minimal HttpClient instance without contacting a server
+        with patch.object(Client, "_init_common_settings", autospec=True):
+            self.client = HttpClient(
+                interface="http",
+                host="localhost",
+                port=8123,
+                username="default",
+                password="",
+                database="default",
+            )
+        self.client.url = "http://localhost:8123"
+
+        # Always turn on show_clickhouse_error. Will disable in tests as needed.
+        self.client.show_clickhouse_errors = True
+
+    def test_error_handler_with_exception_code(self):
+        """Test error handling when ClickHouse exception code is present"""
+
+        # Create mock response with exception code
+        response = create_mock_response(
+            status=500,
+            headers={ex_header: "99"},
+            data=b"Error executing query",
+        )
+
+        with pytest.raises(DatabaseError) as excinfo:
+            self.client._error_handler(response)
+
+        # Verify the error message contains all expected parts
+        error_msg = str(excinfo.value)
+        assert "Received ClickHouse exception, code: 99" in error_msg
+        assert "server response: Error executing query" in error_msg
+        assert self.client.url in error_msg
+        assert excinfo.value.code == 99
+        response.close.assert_called_once()
+
+    def test_error_handler_sets_structured_code_and_name(self):
+        """Code and name are exposed as attributes parsed from the header and body"""
+        response = create_mock_response(
+            status=404,
+            headers={ex_header: "60"},
+            data=b"Code: 60. DB::Exception: Unknown table 'x'. (UNKNOWN_TABLE) (version 26.2.4.23)",
+        )
+
+        with pytest.raises(DatabaseError) as excinfo:
+            self.client._error_handler(response)
+
+        assert excinfo.value.code == 60
+        assert excinfo.value.name == "UNKNOWN_TABLE"
+
+    def test_error_handler_code_none_without_header(self):
+        """Code is None when the server sends no exception header"""
+        response = create_mock_response(status=503, data=b"Service unavailable")
+
+        with pytest.raises(DatabaseError) as excinfo:
+            self.client._error_handler(response)
+
+        assert excinfo.value.code is None
+        assert excinfo.value.name is None
+
+    def test_error_handler_name_parsed_before_truncation(self):
+        """name is parsed from the full body even when max_error_size truncates the message"""
+        long_body = "Code: 62. DB::Exception: " + ("x" * 400) + " (SYNTAX_ERROR) (version 26.2.4.23)"
+        response = create_mock_response(status=400, headers={ex_header: "62"}, data=long_body.encode())
+
+        original = common.get_setting("max_error_size")
+        common.set_setting("max_error_size", 100)
+        try:
+            with pytest.raises(DatabaseError) as excinfo:
+                self.client._error_handler(response)
+        finally:
+            common.set_setting("max_error_size", original)
+
+        assert excinfo.value.code == 62
+        assert excinfo.value.name == "SYNTAX_ERROR"
+        assert "SYNTAX_ERROR" not in str(excinfo.value)  # truncated out of the displayed message
+
+    def test_error_handler_without_exception_code(self):
+        """Test error handling when only HTTP status is available"""
+
+        # Create mock response without exception code
+        response = create_mock_response(status=503, data=b"Service unavailable")
+
+        with pytest.raises(DatabaseError) as excinfo:
+            self.client._error_handler(response)
+
+        # Verify the error message contains all expected parts
+        error_msg = str(excinfo.value)
+        assert "HTTP driver received HTTP status 503" in error_msg
+        assert "server response: Service unavailable" in error_msg
+        assert self.client.url in error_msg
+        response.close.assert_called_once()
+
+    def test_error_handler_with_empty_body(self):
+        """Test error handling when response body is empty"""
+
+        # Create mock response with empty body
+        response = create_mock_response(status=400, headers={ex_header: "99"}, data=b"")
+
+        with pytest.raises(DatabaseError) as excinfo:
+            self.client._error_handler(response)
+
+        # Verify the error message contains expected parts but not empty body
+        error_msg = str(excinfo.value)
+        assert "Received ClickHouse exception, code: 99" in error_msg
+        assert "server response:" not in error_msg  # No body, so no server response part
+        assert self.client.url in error_msg
+        response.close.assert_called_once()
+
+    def test_error_handler_with_errors_disabled(self):
+        """Test error handling when show_clickhouse_errors is disabled"""
+        # Explicitly disable showing ClickHouse errors
+        self.client.show_clickhouse_errors = False
+
+        # Create mock response
+        response = create_mock_response(
+            status=400,
+            headers={ex_header: "99"},
+            data=b"Invalid query",
+        )
+
+        with pytest.raises(DatabaseError) as excinfo:
+            self.client._error_handler(response)
+
+        # Verify the error message is generic and does not leak host/URL
+        error_msg = str(excinfo.value)
+        assert error_msg == "The ClickHouse server returned an error"
+        assert "Invalid query" not in error_msg  # Should not include the body
+        assert "99" not in error_msg  # Should not include the exception code
+        assert self.client.url not in error_msg
+        # Numeric code is still exposed structurally, but the body-derived name is suppressed
+        assert excinfo.value.code == 99
+        assert excinfo.value.name is None
+        response.close.assert_called_once()
+
+    def test_error_handler_with_scrub_mode(self):
+        """scrub keeps the SQL error but strips version trailer and URL"""
+        self.client.show_clickhouse_errors = "scrub"
+        response = create_mock_response(
+            status=404,
+            headers={ex_header: "60"},
+            data=(b"Code: 60. DB::Exception: Unknown table 'x'. (UNKNOWN_TABLE) (version 26.2.4.23 (official build))"),
+        )
+
+        with pytest.raises(DatabaseError) as excinfo:
+            self.client._error_handler(response)
+
+        error_msg = str(excinfo.value)
+        assert "Received ClickHouse exception, code: 60" in error_msg
+        assert "Unknown table 'x'" in error_msg
+        assert "(UNKNOWN_TABLE)" in error_msg
+        assert "version" not in error_msg
+        assert "official build" not in error_msg
+        assert self.client.url not in error_msg
+        assert "(for url" not in error_msg
+        assert excinfo.value.code == 60
+        assert excinfo.value.name == "UNKNOWN_TABLE"
+        response.close.assert_called_once()
+
+    def test_show_clickhouse_errors_setter_coerces_scrub(self):
+        self.client.show_clickhouse_errors = "SCRUB"
+        response = create_mock_response(
+            status=404,
+            headers={ex_header: "60"},
+            data=(b"Code: 60. DB::Exception: Unknown table 'x'. (UNKNOWN_TABLE) (version 26.2.4.23 (official build))"),
+        )
+
+        with pytest.raises(DatabaseError) as excinfo:
+            self.client._error_handler(response)
+
+        error_msg = str(excinfo.value)
+        assert "Unknown table 'x'" in error_msg
+        assert "UNKNOWN_TABLE" in error_msg
+        assert "version" not in error_msg
+        assert self.client.url not in error_msg
+
+    def test_show_clickhouse_errors_setter_rejects_invalid(self):
+        with pytest.raises(ProgrammingError, match="show_clickhouse_errors"):
+            self.client.show_clickhouse_errors = "redact"
+
+    def test_transport_error_scrub_mode_is_generic(self, caplog):
+        self.client.show_clickhouse_errors = "scrub"
+        error = HTTPError("Cannot connect to host localhost:8123/?token=secret")
+        pool_mgr = Mock()
+        pool_mgr.request.side_effect = error
+        self.client.http = pool_mgr
+
+        with caplog.at_level(logging.WARNING), pytest.raises(OperationalError) as excinfo:
+            self.client._raw_request(b"", {"query": "SELECT 13"})
+
+        assert str(excinfo.value) == "Error executing HTTP request"
+        assert excinfo.value.__cause__ is error
+        assert "localhost" not in str(excinfo.value)
+        assert "secret" not in str(excinfo.value)
+        assert any(record.levelno == logging.WARNING and "Http Driver Exception" in record.message for record in caplog.records)
+
+    def test_error_handler_with_unicode_decode_error(self):
+        """Test error handling when the response body has invalid Unicode"""
+
+        # Create response with invalid UTF-8 sequence
+        response = create_mock_response(status=500, data=b"\xff\xfe Invalid UTF-8 sequence")
+
+        with pytest.raises(DatabaseError) as excinfo:
+            self.client._error_handler(response)
+
+        # Verify error message contains the backslash-escaped bytes
+        error_msg = str(excinfo.value)
+        assert "HTTP driver received HTTP status 500" in error_msg
+        assert "server response:" in error_msg  # Should have backslash-escaped data
+        response.close.assert_called_once()
+
+    def test_error_handler_with_retried_flag(self):
+        """Test error handling with retried flag set to True"""
+        # Create mock response
+        response = create_mock_response(status=500, data=b"Server error")
+
+        # Test the error handler with retried=True
+        with pytest.raises(OperationalError) as excinfo:
+            self.client._error_handler(response, retried=True)
+
+        # Verify that OperationalError is raised instead of DatabaseError
+        assert isinstance(excinfo.value, OperationalError)
+        response.close.assert_called_once()
+
+    @patch("clickhouse_connect.driver._backend.http_sync.get_response_data")
+    def test_error_handler_with_body_reading_exception(self, mock_get_response_data, caplog):
+        """Test error handling when reading the response body throws an exception"""
+        # Set up the mock to raise an exception when reading the response body
+        mock_get_response_data.side_effect = Exception("Error reading response data")
+
+        # Swallow logging messages to prevent polluting pytest output
+        caplog.set_level(logging.CRITICAL)
+
+        # Create mock response
+        response = create_mock_response(
+            status=500,
+            headers={"X-ClickHouse-Exception-Code": "99"},
+            data=b"Some data",  # This won't be read due to the mocked exception
+        )
+
+        with pytest.raises(DatabaseError) as excinfo:
+            self.client._error_handler(response)
+
+        # Verify the error message has the exception code but no body
+        error_msg = str(excinfo.value)
+        assert "Received ClickHouse exception, code: 99" in error_msg
+        assert "server response:" not in error_msg  # No body due to exception
+        assert self.client.url in error_msg
+
+        # Verify the mock was called
+        mock_get_response_data.assert_called_once_with(response)
+        response.close.assert_called_once()
+
+
+class TestQuery:
+    """Test the form encoding and external data handling in HttpClient"""
+
+    def setup_method(self):
+        """Set up common test fixtures"""
+        self.client = HttpClient(
+            interface="http",
+            host="localhost",
+            port=8123,
+            username="default",
+            password="",
+            database="default",
+        )
+
+    # Helper methods
+
+    @staticmethod
+    def create_mock_external_data() -> Mock:
+        """Create a mock ExternalData object with standard test data"""
+        external_data = Mock(spec=ExternalData)
+        external_data.query_params = {"_file1_format": "CSV", "_file1_structure": "id UInt32"}
+        external_data.form_data = {"_file1": b"1\n2\n3\n"}
+        return external_data
+
+    @staticmethod
+    def create_mock_query_context(
+        query: str = "SELECT * FROM table", bind_params: dict[str, Any] | None = None, external_data: ExternalData | None = None
+    ) -> Mock:
+        """Create a mock QueryContext with common test values"""
+        context = Mock(spec=QueryContext)
+        context.final_query = f"{query}\n FORMAT Native"
+        context.bind_params = bind_params or {}
+        context.external_data = external_data
+        context.is_insert = False
+        context.uncommented_query = query
+        context.settings = {}
+        context.transport_settings = {}
+        context.streaming = False
+        return context
+
+    @staticmethod
+    def setup_mock_raw_request() -> MagicMock:
+        """Create a mock for _raw_request with standard response"""
+        mock_response = MagicMock()
+        mock_response.headers = {}
+        return mock_response
+
+    @staticmethod
+    def extract_raw_request_params(mock_raw_request: MagicMock) -> tuple[Any, dict, dict]:
+        assert mock_raw_request.called
+        call_args = mock_raw_request.call_args
+
+        # Extract positional arguments
+        body = call_args[0][0] if len(call_args[0]) > 0 else None
+        params = call_args[0][1] if len(call_args[0]) > 1 else {}
+
+        # Extract fields from keyword arguments
+        fields = call_args[1].get("fields", {}) if call_args[1] else {}
+
+        return body, params, fields
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_raw_query(self, mock_raw_request):
+        """Test raw_query with neither form_encode_query_params nor external_data"""
+        self.client.form_encode_query_params = False
+
+        # Setup mock response
+        mock_response = Mock()
+        mock_response.data = b"test_result"
+        mock_raw_request.return_value = mock_response
+
+        query = "SELECT * FROM table WHERE id = {id:UInt32}"
+        parameters = {"id": 123}
+
+        # Call raw_query
+        result = self.client.raw_query(query, parameters=parameters)
+
+        # Verify result
+        assert result == b"test_result"
+
+        # Check the call to _raw_request
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        assert isinstance(body, str)
+        assert body
+        assert "SELECT * FROM table WHERE id =" in body
+        assert "param_id" in params
+        assert not fields
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_raw_query_with_form_encode(self, mock_raw_request):
+        """Test raw_query with form_encode_query_params=True"""
+        self.client.form_encode_query_params = True
+
+        # Setup mock response
+        mock_response = Mock()
+        mock_response.data = b"test_result"
+        mock_raw_request.return_value = mock_response
+
+        query = "SELECT * FROM table WHERE id = {id:UInt32}"
+        parameters = {"id": 123}
+
+        # Call raw_query
+        result = self.client.raw_query(query, parameters=parameters)
+
+        # Verify result
+        assert result == b"test_result"
+
+        # Check the call to _raw_request
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        assert isinstance(body, bytes)
+        assert body == b""
+        assert "query" in fields
+        assert isinstance(fields["query"], str)
+        assert "SELECT * FROM table WHERE id =" in fields["query"]
+        assert "param_id" in fields
+        assert "param_id" not in params
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_raw_query_auto_form_encode_large_params(self, mock_raw_request):
+        """Large bind params auto-promote to form data even with form_encode_query_params=False"""
+        self.client.form_encode_query_params = False
+
+        mock_response = Mock()
+        mock_response.data = b"test_result"
+        mock_raw_request.return_value = mock_response
+
+        query = "SELECT * FROM table WHERE name = {name:String}"
+        parameters = {"name": "x" * 5000}
+
+        self.client.raw_query(query, parameters=parameters)
+
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+        assert body == b""
+        assert "param_name" in fields
+        assert "param_name" not in params
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_raw_query_with_external_data_only(self, mock_raw_request):
+        """Test raw_query with external_data only (no form_encode)"""
+        self.client.form_encode_query_params = False
+
+        # Setup mock response
+        mock_response = Mock()
+        mock_response.data = b"100"
+        mock_raw_request.return_value = mock_response
+
+        external_data = self.create_mock_external_data()
+        query = "SELECT COUNT() FROM file1"
+
+        # Call raw_query
+        result = self.client.raw_query(query, external_data=external_data)
+
+        # Verify result
+        assert result == b"100"
+
+        # Check the call to _raw_request
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        assert isinstance(body, bytes)
+        assert body == b""
+        assert "query" in params
+        assert isinstance(params["query"], str)
+        assert params["query"] == query
+        assert "_file1_format" in params
+        assert "_file1" in fields
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_raw_query_with_form_encode_and_external_data(self, mock_raw_request):
+        """Test raw_query with both form_encode_query_params and external_data"""
+        self.client.form_encode_query_params = True
+
+        # Setup mock response
+        mock_response = Mock()
+        mock_response.data = b"150"
+        mock_raw_request.return_value = mock_response
+
+        external_data = self.create_mock_external_data()
+        query = "SELECT COUNT() FROM file1 WHERE value > {min_val:UInt32}"
+        parameters = {"min_val": 10}
+
+        # Call raw_query
+        result = self.client.raw_query(query, parameters=parameters, external_data=external_data)
+
+        # Verify result
+        assert result == b"150"
+
+        # Check the call to _raw_request
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        assert isinstance(body, bytes)
+        assert body == b""
+        assert "query" not in params
+        assert "query" in fields
+        assert isinstance(fields["query"], str)
+        assert "_file1_format" in params
+        assert "_file1" in fields
+        assert "param_min_val" in fields
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_raw_query_form_encode_without_external_data(self, mock_raw_request):
+        """Test that query goes to fields when form_encode is True but no external_data"""
+        self.client.form_encode_query_params = True
+
+        # Setup mock response
+        mock_response = Mock()
+        mock_response.data = b"50"
+        mock_raw_request.return_value = mock_response
+
+        query = "SELECT COUNT() FROM table"
+
+        # Call raw_query
+        result = self.client.raw_query(query)
+
+        # Verify result
+        assert result == b"50"
+
+        # Check the call to _raw_request
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        assert isinstance(body, bytes)
+        assert body == b""
+        assert "query" not in params
+        assert "query" in fields
+        assert isinstance(fields["query"], str)
+        assert fields["query"] == query
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_raw_query_with_settings(self, mock_raw_request):
+        """Test raw_query properly handles settings parameter"""
+        self.client.form_encode_query_params = False
+
+        # Setup mock response
+        mock_response = Mock()
+        mock_response.data = b"result_with_settings"
+        mock_raw_request.return_value = mock_response
+
+        query = "SELECT * FROM table"
+        settings = {"max_threads": 4, "max_memory_usage": 1000000}
+
+        # Call raw_query
+        result = self.client.raw_query(query, settings=settings)
+
+        # Verify result
+        assert result == b"result_with_settings"
+
+        # Check the call to _raw_request
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        assert isinstance(body, str)
+        assert "max_threads" in params
+        assert params["max_threads"] == 4
+        assert "max_memory_usage" in params
+        assert params["max_memory_usage"] == 1000000
+        assert not fields
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_raw_query_with_map_setting(self, mock_raw_request):
+        """A dict-valued setting (e.g. `additional_table_filters`) must be rendered as a
+        properly quoted/escaped ClickHouse map literal, not Python's own str()/repr of the
+        dict. Python's repr uses double quotes for values containing a single quote, which
+        the server rejects with "Cannot parse quoted string: expected opening quote ''', got
+        '"'." (see GH issue #501)."""
+        self.client.form_encode_query_params = False
+
+        mock_response = Mock()
+        mock_response.data = b"result_with_map_setting"
+        mock_raw_request.return_value = mock_response
+
+        query = "SELECT * FROM table"
+        settings = {"additional_table_filters": {"a": "'some_value'"}}
+
+        result = self.client.raw_query(query, settings=settings)
+
+        assert result == b"result_with_map_setting"
+
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        assert "additional_table_filters" in params
+        rendered = params["additional_table_filters"]
+        assert isinstance(rendered, str)
+        # Must be a single-quoted ClickHouse map literal with the embedded quotes escaped,
+        # never Python's dict repr (which mixes double and single quotes).
+        assert rendered == "{'a': '\\'some_value\\''}"
+        assert '"' not in rendered
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_raw_query_with_format(self, mock_raw_request):
+        """Test raw_query properly appends FORMAT clause"""
+        self.client.form_encode_query_params = False
+
+        # Setup mock response
+        mock_response = Mock()
+        mock_response.data = b'{"data": "json_formatted"}'
+        mock_raw_request.return_value = mock_response
+
+        query = "SELECT * FROM table"
+        fmt = "JSONEachRow"
+
+        # Call raw_query
+        result = self.client.raw_query(query, fmt=fmt)
+
+        # Verify result
+        assert result == b'{"data": "json_formatted"}'
+
+        # Check the call to _raw_request
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        assert isinstance(body, str)
+        assert "FORMAT JSONEachRow" in body
+        assert params is not None
+        assert not fields
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_raw_query_database_handling(self, mock_raw_request):
+        """Test raw_query properly handles database parameter"""
+        self.client.form_encode_query_params = False
+        self.client.database = "test_db"
+
+        # Setup mock response
+        mock_response = Mock()
+        mock_response.data = b"db_result"
+        mock_raw_request.return_value = mock_response
+
+        query = "SELECT * FROM table"
+
+        # Test with use_database=True (default)
+        result = self.client.raw_query(query, use_database=True)
+        assert result == b"db_result"
+
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+        assert isinstance(body, str)
+        assert "database" in params
+        assert params["database"] == "test_db"
+        assert not fields
+
+        # Reset mock for second test
+        mock_raw_request.reset_mock()
+        mock_raw_request.return_value = mock_response
+
+        # Test with use_database=False
+        result = self.client.raw_query(query, use_database=False)
+        assert result == b"db_result"
+
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+        assert isinstance(body, str)
+        assert "database" not in params
+        assert not fields
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_query_with_context(self, mock_raw_request):
+        """Test _query_with_context with neither form_encode_query_params nor external_data"""
+        self.client.form_encode_query_params = False
+
+        # Setup mocks
+        mock_raw_request.return_value = self.setup_mock_raw_request()
+        self.client._transform = Mock()
+        self.client._transform.parse_response.return_value = Mock(summary=None)
+
+        # Create context
+        context = self.create_mock_query_context(query="SELECT * FROM table WHERE id = 123", bind_params={"param_id": 123})
+
+        # Call the method
+        self.client._query_with_context(context)
+
+        # Check the call to _raw_request
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        assert isinstance(body, str)
+        assert "SELECT * FROM table WHERE id =" in body
+        assert "param_id" in params
+        assert not fields
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_query_with_context_form_encode(self, mock_raw_request):
+        """Test _query_with_context with form_encode_query_params=True"""
+        self.client.form_encode_query_params = True
+
+        # Setup mocks
+        mock_raw_request.return_value = self.setup_mock_raw_request()
+        self.client._transform = Mock()
+        self.client._transform.parse_response.return_value = Mock(summary=None)
+
+        # Create context
+        context = self.create_mock_query_context(query="SELECT * FROM table WHERE id = 123", bind_params={"param_id": 123})
+
+        # Call the method
+        self.client._query_with_context(context)
+
+        # Check the call to _raw_request
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        assert isinstance(body, bytes)
+        assert body == b""
+        assert "query" in fields
+        assert "param_id" in fields
+        assert "param_id" not in params
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_query_with_context_auto_form_encode_large_params(self, mock_raw_request):
+        """Large bind params auto-promote to form data even with form_encode_query_params=False"""
+        self.client.form_encode_query_params = False
+
+        mock_raw_request.return_value = self.setup_mock_raw_request()
+        self.client._transform = Mock()
+        self.client._transform.parse_response.return_value = Mock(summary=None)
+
+        context = self.create_mock_query_context(query="SELECT * FROM table WHERE name = 'x'", bind_params={"param_name": "x" * 5000})
+
+        self.client._query_with_context(context)
+
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+        assert body == b""
+        assert "param_name" in fields
+        assert "param_name" not in params
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_query_with_context_external_data(self, mock_raw_request):
+        """Test _query_with_context with external_data only"""
+        self.client.form_encode_query_params = False
+
+        # Setup mocks
+        mock_raw_request.return_value = self.setup_mock_raw_request()
+        self.client._transform = Mock()
+        self.client._transform.parse_response.return_value = Mock(summary=None)
+
+        # Create external data and context
+        external_data = self.create_mock_external_data()
+        context = self.create_mock_query_context(query="SELECT * FROM file1", external_data=external_data)
+
+        # Call the method
+        self.client._query_with_context(context)
+
+        # Check the call to _raw_request
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        assert isinstance(body, bytes)
+        assert body == b""
+        assert "query" in params
+        assert isinstance(params["query"], str)
+        assert "_file1_format" in params
+        assert "_file1" in fields
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_query_with_context_with_form_encode_and_external_data(self, mock_raw_request):
+        """Test _query_with_context with both form_encode_query_params and external_data"""
+        self.client.form_encode_query_params = True
+
+        # Setup mocks
+        mock_raw_request.return_value = self.setup_mock_raw_request()
+        self.client._transform = Mock()
+        self.client._transform.parse_response.return_value = Mock(summary=None)
+
+        # Create external data and context
+        external_data = self.create_mock_external_data()
+        context = self.create_mock_query_context(
+            query="SELECT * FROM file1 WHERE value > 10", bind_params={"param_min_val": 10}, external_data=external_data
+        )
+
+        # Call the method
+        self.client._query_with_context(context)
+
+        # Check the call to _raw_request
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        assert isinstance(body, bytes)
+        assert body == b""
+        assert "query" not in params
+        assert "query" in fields
+        assert isinstance(fields["query"], str)
+        assert "_file1_format" in params
+        assert "_file1" in fields
+        assert "param_min_val" in fields
+
+    @patch.object(HttpSyncBackend, "request")
+    @patch("clickhouse_connect.driver._backend.httpcommon.columns_only_re")
+    def test_query_with_context_schema_probe_form_encode(self, mock_columns_re, mock_raw_request):
+        """Test that schema-probe queries (LIMIT 0) work correctly with form_encode_query_params"""
+        self.client.form_encode_query_params = True
+
+        # Mock the columns_only_re to match LIMIT 0
+        mock_columns_re.search.return_value = True
+
+        # Setup mock response for schema probe
+        mock_response = Mock()
+        mock_response.data = b'{"meta": [{"name": "id", "type": "UInt32"}, {"name": "name", "type": "String"}]}'
+        mock_response.headers = {}
+        mock_raw_request.return_value = mock_response
+
+        # Create query context
+        context = self.create_mock_query_context(
+            query="SELECT * FROM table WHERE id = {id:UInt32} LIMIT 0", bind_params={"param_id": "123"}
+        )
+        context.uncommented_query = "SELECT * FROM table WHERE id = {id:UInt32} LIMIT 0"
+        context.is_insert = False
+        context.final_query = "SELECT * FROM table WHERE id = {id:UInt32} LIMIT 0"
+        context.settings = {}
+        context.transport_settings = {}
+        context.streaming = False
+        context.block_info = False
+        context.set_response_tz = Mock()
+        context.column_renamer = None
+
+        # Call _query_with_context
+        self.client._query_with_context(context)
+
+        # Extract parameters from the mock call
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        # Verify that form encoding was used for schema probe
+        assert body == b""  # Body should be empty with form encoding
+        assert fields is not None  # Fields should be populated
+        assert "query" in fields
+        assert "FORMAT JSON" in fields["query"]
+        assert "param_id" in fields
+        assert fields["param_id"] == "123"
+
+        # Verify params dont contain the query or bind params
+        assert "query" not in params
+        assert "param_id" not in params
+
+    @patch.object(HttpSyncBackend, "request")
+    @patch("clickhouse_connect.driver._backend.httpcommon.columns_only_re")
+    def test_query_with_context_schema_probe_external_data(self, mock_columns_re, mock_raw_request):
+        """Test schema-probe queries (LIMIT 0) with external data but no form encoding"""
+        self.client.form_encode_query_params = False
+
+        # Mock the columns_only_re to match LIMIT 0
+        mock_columns_re.search.return_value = True
+
+        # Setup mock response for schema probe
+        mock_response = Mock()
+        mock_response.data = b'{"meta": [{"name": "id", "type": "UInt32"}, {"name": "count", "type": "UInt64"}]}'
+        mock_response.headers = {}
+        mock_raw_request.return_value = mock_response
+
+        # Create external data and context
+        external_data = self.create_mock_external_data()
+        context = self.create_mock_query_context(query="SELECT * FROM file1 LIMIT 0", external_data=external_data)
+        context.uncommented_query = "SELECT * FROM file1 LIMIT 0"
+        context.is_insert = False
+        context.final_query = "SELECT * FROM file1 LIMIT 0"
+        context.settings = {}
+        context.transport_settings = {}
+        context.streaming = False
+        context.block_info = False
+        context.set_response_tz = Mock()
+        context.column_renamer = None
+
+        # Call _query_with_context
+        self.client._query_with_context(context)
+
+        # Extract parameters from the mock call
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        # Verify external data handling without form encoding
+        assert body == b""  # Body should be empty when using external data
+        assert "query" in params  # Query should be in params
+        assert "FORMAT JSON" in params["query"]
+        assert "_file1_format" in params  # External data query params
+        assert "_file1" in fields  # External data form fields
+
+    @patch.object(HttpSyncBackend, "request")
+    def test_query_with_context_schema_probe_form_encode_external_data(self, mock_raw_request):
+        """Test schema-probe queries (LIMIT 0) with both form encoding and external data"""
+        self.client.form_encode_query_params = True
+
+        # Setup mock response for schema probe
+        mock_response = Mock()
+        mock_response.data = b'{"meta": [{"name": "id", "type": "UInt32"}, {"name": "value", "type": "Float64"}]}'
+        mock_response.headers = {}
+        mock_raw_request.return_value = mock_response
+
+        # Create external data and context
+        external_data = self.create_mock_external_data()
+        context = self.create_mock_query_context(
+            query="SELECT * FROM file1 WHERE value > 10 LIMIT 0",
+            bind_params={"param_min_val": 10},
+            external_data=external_data,
+        )
+        context.uncommented_query = "SELECT * FROM file1 WHERE value > 10 LIMIT 0"
+        context.is_insert = False
+        context.final_query = "SELECT * FROM file1 WHERE value > 10 LIMIT 0"
+        context.settings = {}
+        context.transport_settings = {}
+        context.streaming = False
+        context.block_info = False
+        context.set_response_tz = Mock()
+        context.column_renamer = None
+
+        # Call _query_with_context
+        self.client._query_with_context(context)
+
+        # Extract parameters from the mock call
+        body, params, fields = self.extract_raw_request_params(mock_raw_request)
+
+        # Verify both form encoding and external data handling
+        assert body == b""  # Body should be empty
+        assert "query" in fields  # Query should be in fields (form encoding)
+        assert "FORMAT JSON" in fields["query"]
+        assert "param_min_val" in fields  # Bind params in fields
+        assert "_file1_format" in params  # External data query params
+        assert "_file1" in fields  # External data form fields
+        assert "query" not in params  # Query should not be in params when form encoding
+
+
+class TestResponseTimezone:
+    """set_response_tz is called only when the server reports a timezone different from server_tz."""
+
+    def setup_method(self):
+        with patch.object(Client, "_init_common_settings", autospec=True):
+            self.client = HttpClient(
+                interface="http",
+                host="localhost",
+                port=8123,
+                username="default",
+                password="",
+                database="default",
+            )
+        self.client.server_tz = timezone.utc
+        self.client._dst_safe = True
+
+    @staticmethod
+    def _make_context() -> Mock:
+        context = Mock(spec=QueryContext)
+        context.final_query = "SELECT 1"
+        context.uncommented_query = "SELECT 1"
+        context.bind_params = {}
+        context.external_data = None
+        context.is_insert = False
+        context.settings = {}
+        context.transport_settings = {}
+        context.streaming = False
+        context.block_info = False
+        return context
+
+    def _run(self, tz_header: str | None) -> Mock:
+        """Invoke _query_with_context with a mocked response and return the context Mock."""
+        mock_response = Mock()
+        mock_response.headers = {} if tz_header is None else {"X-ClickHouse-Timezone": tz_header}
+        context = self._make_context()
+
+        with (
+            patch.object(HttpSyncBackend, "request", return_value=mock_response),
+            patch("clickhouse_connect.driver._backendclient.RespBuffCls"),
+            patch("clickhouse_connect.driver._backend.http_sync.ResponseSource"),
+            patch.object(self.client._transform, "parse_response", return_value=Mock()),
+        ):
+            self.client._query_with_context(context)
+
+        return context
+
+    def test_set_response_tz_not_called_when_header_absent(self):
+        """set_response_tz is not called when X-ClickHouse-Timezone header is missing."""
+        context = self._run(tz_header=None)
+        context.set_response_tz.assert_not_called()
+
+    def test_set_response_tz_not_called_when_timezone_matches_server(self):
+        """set_response_tz is not called when the response timezone matches server_tz."""
+        context = self._run(tz_header="UTC")
+        context.set_response_tz.assert_not_called()
+
+    def test_set_response_tz_called_with_correct_tzinfo_when_timezone_differs(self):
+        """set_response_tz is called with the resolved tzinfo when the response timezone differs."""
+        context = self._run(tz_header="America/New_York")
+        context.set_response_tz.assert_called_once()
+        called_tz = context.set_response_tz.call_args[0][0]
+        assert called_tz == zoneinfo.ZoneInfo("America/New_York")
+
+
+class TestCommandBinaryBindGuard:
+    """command() rejects binary parameter binds that cannot share the request body."""
+
+    def setup_method(self):
+        with patch.object(Client, "_init_common_settings", autospec=True):
+            self.client = HttpClient(
+                interface="http",
+                host="localhost",
+                port=8123,
+                username="default",
+                password="",
+                database="default",
+            )
+        self.client.server_tz = timezone.utc
+
+    def test_command_binary_bind_with_data_raises(self):
+        with pytest.raises(ProgrammingError, match="Binary parameter bind"):
+            self.client.command("SELECT $bin$", parameters={"$bin$": b"\x00\x01"}, data="extra")
+
+    @pytest.mark.asyncio
+    async def test_async_command_binary_bind_with_data_raises(self):
+        client = AsyncClient(
+            interface="http",
+            host="localhost",
+            port=8123,
+            username="default",
+            password="",
+            database="default",
+        )
+        with pytest.raises(ProgrammingError, match="Binary parameter bind"):
+            await client.command("SELECT $bin$", parameters={"$bin$": b"\x00\x01"}, data="extra")
+
+
+class TestRawQuerySemicolonPreparation:
+    @staticmethod
+    def prep(query, parameters=None, fmt="TabSeparated"):
+        client = Mock()
+        client.server_tz = timezone.utc
+        client.database = "default"
+        client.query_retries = 2
+        client._validate_settings.return_value = {}
+        return Client._prep_raw_query_runtime(client, query, parameters, None, fmt, True)
+
+    @pytest.mark.parametrize(
+        "query, fmt, expected_query, expected_calls",
+        [
+            ("SELECT 13", None, "SELECT 13", 0),
+            ("SELECT 13;", "TabSeparated", "SELECT 13\n FORMAT TabSeparated", 0),
+            ("SELECT 13; -- trailing", "TabSeparated", "SELECT 13 -- trailing\n FORMAT TabSeparated", 1),
+            ("SHOW TABLES; -- trailing", "TabSeparated", "SHOW TABLES -- trailing\n FORMAT TabSeparated", 1),
+            (
+                "SELECT ' INSERT INTO '; -- trailing",
+                "TabSeparated",
+                "SELECT ' INSERT INTO ' -- trailing\n FORMAT TabSeparated",
+                1,
+            ),
+            (
+                "WITH ' INSERT INTO ' AS value SELECT value; -- trailing",
+                "TabSeparated",
+                "WITH ' INSERT INTO ' AS value SELECT value -- trailing\n FORMAT TabSeparated",
+                1,
+            ),
+            (
+                "SELECT 13; /* separator */ ;",
+                "TabSeparated",
+                "SELECT 13 /* separator */ \n FORMAT TabSeparated",
+                1,
+            ),
+            (
+                "SELECT 13; /* inner; */ ;",
+                "TabSeparated",
+                "SELECT 13 /* inner; */ \n FORMAT TabSeparated",
+                1,
+            ),
+            (
+                "INSERT INTO tbl FORMAT TabSeparated\nvalue_1;\n",
+                "TabSeparated",
+                "INSERT INTO tbl FORMAT TabSeparated\nvalue_1;\n\n FORMAT TabSeparated",
+                0,
+            ),
+            (
+                "INSERT INTO tbl FORMAT TabSeparated\nvalue_1;",
+                "TabSeparated",
+                "INSERT INTO tbl FORMAT TabSeparated\nvalue_1;\n FORMAT TabSeparated",
+                0,
+            ),
+        ],
+    )
+    def test_lexer_routing(self, query, fmt, expected_query, expected_calls):
+        with patch(
+            "clickhouse_connect.driver.client._strip_trailing_semicolons",
+            wraps=_strip_trailing_semicolons,
+        ) as strip:
+            final_query, _, _ = self.prep(query, fmt=fmt)
+
+        assert final_query == expected_query
+        assert strip.call_count == expected_calls
+
+    def test_format_name_with_trailing_semicolon_keeps_bound_query_intact(self):
+        final_query, _, _ = self.prep("SELECT %(value)s", parameters={"value": 13}, fmt="TabSeparated;")
+        assert final_query == "SELECT 13\n FORMAT TabSeparated;"
+
+    def test_format_name_with_trailing_semicolon_keeps_payload_intact(self):
+        class SqlKeyword:
+            def __str__(self):
+                return "INSERT"
+
+        query = "%(verb)s INTO tbl FORMAT TabSeparated\nvalue_1;\n"
+        final_query, _, _ = self.prep(query, parameters={"verb": SqlKeyword()}, fmt="TabSeparated;")
+        assert final_query == "INSERT INTO tbl FORMAT TabSeparated\nvalue_1;\n\n FORMAT TabSeparated;"
+
+    def test_bound_insert_payload_is_not_lexed(self):
+        class SqlKeyword:
+            def __str__(self):
+                return "INSERT"
+
+        query = "%(verb)s INTO tbl FORMAT TabSeparated\nvalue_1;\n"
+        with patch("clickhouse_connect.driver.client._strip_trailing_semicolons") as strip:
+            final_query, _, _ = self.prep(query, parameters={"verb": SqlKeyword()})
+
+        assert final_query == "INSERT INTO tbl FORMAT TabSeparated\nvalue_1;\n\n FORMAT TabSeparated"
+        strip.assert_not_called()
+
+    def test_bind_completed_insert_payload_is_not_lexed(self):
+        class Raw:
+            def __str__(self):
+                return ""
+
+        query = "INSERT %sINTO tbl FORMAT TabSeparated\nvalue_1;\n"
+        with patch("clickhouse_connect.driver.client._strip_trailing_semicolons") as strip:
+            final_query, _, _ = self.prep(query, parameters=[Raw()])
+
+        assert final_query == "INSERT INTO tbl FORMAT TabSeparated\nvalue_1;\n\n FORMAT TabSeparated"
+        strip.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "query, parameters, expected_query",
+        [
+            (
+                "WITH {SELECT:Int32} AS value INSERT INTO tbl FORMAT TabSeparated\nvalue_1;\n",
+                {"SELECT": 13},
+                "WITH {SELECT:Int32} AS value INSERT INTO tbl FORMAT TabSeparated\nvalue_1;\n\n FORMAT TabSeparated",
+            ),
+            (
+                "WITH {INSERT:Int32} AS value SELECT value; -- trailing",
+                {"INSERT": 13},
+                "WITH {INSERT:Int32} AS value SELECT value -- trailing\n FORMAT TabSeparated",
+            ),
+        ],
+    )
+    def test_server_placeholder_names_do_not_change_routing(self, query, parameters, expected_query):
+        final_query, _, _ = self.prep(query, parameters=parameters)
+        assert final_query == expected_query
+
+    def test_with_prefixed_bound_insert_payload_is_not_lexed(self):
+        class SqlKeyword:
+            calls = 0
+
+            def __str__(self):
+                self.calls += 1
+                return "INSERT"
+
+        keyword = SqlKeyword()
+        query = "WITH 1 AS y %(verb)s INTO tbl FORMAT TabSeparated\nvalue_1;\n"
+        with patch("clickhouse_connect.driver.client._strip_trailing_semicolons") as strip:
+            final_query, _, _ = self.prep(query, parameters={"verb": keyword})
+
+        assert final_query == "WITH 1 AS y INSERT INTO tbl FORMAT TabSeparated\nvalue_1;\n\n FORMAT TabSeparated"
+        assert keyword.calls == 1
+        strip.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "%(verb)s INTO tbl FORMAT TabSeparated\nvalue_1;",
+            "WITH 1 AS y %(verb)s INTO tbl FORMAT TabSeparated\nvalue_1;",
+        ],
+    )
+    def test_generated_insert_preserves_direct_payload_semicolon(self, query):
+        class SqlKeyword:
+            calls = 0
+
+            def __str__(self):
+                self.calls += 1
+                return "INSERT"
+
+        keyword = SqlKeyword()
+        final_query, _, _ = self.prep(query, parameters={"verb": keyword})
+
+        expected_prefix = query.replace("%(verb)s", "INSERT")
+        assert final_query == f"{expected_prefix}\n FORMAT TabSeparated"
+        assert keyword.calls == 1
+
+    @pytest.mark.parametrize(
+        "statement, expected_query, expected_lexer_calls",
+        [
+            ("SELECT 13;", "SELECT 13\n FORMAT TabSeparated", 0),
+            ("SELECT 13; -- trailing", "SELECT 13 -- trailing\n FORMAT TabSeparated", 1),
+        ],
+    )
+    def test_parameter_generated_terminator_is_normalized_once(self, statement, expected_query, expected_lexer_calls):
+        class StatefulStatement:
+            calls = 0
+
+            def __str__(self):
+                self.calls += 1
+                return statement
+
+        value = StatefulStatement()
+        with (
+            patch("clickhouse_connect.driver.client._query_is_insert", wraps=_query_is_insert) as is_insert,
+            patch(
+                "clickhouse_connect.driver.client._strip_trailing_semicolons",
+                wraps=_strip_trailing_semicolons,
+            ) as strip,
+        ):
+            final_query, _, _ = self.prep("%(statement)s", parameters={"statement": value})
+
+        assert final_query == expected_query
+        assert value.calls == 1
+        assert is_insert.call_count == 1
+        assert strip.call_count == expected_lexer_calls
+
+    def test_parameter_generated_statement_is_bound_once(self):
+        class StatefulStatement:
+            calls = 0
+
+            def __str__(self):
+                self.calls += 1
+                return "SELECT 13"
+
+        statement = StatefulStatement()
+        final_query, _, _ = self.prep("%(statement)s; -- trailing", parameters={"statement": statement})
+
+        assert final_query == "SELECT 13 -- trailing\n FORMAT TabSeparated"
+        assert statement.calls == 1
+
+    def test_binary_bind_lexes_only_the_template(self):
+        query = "SELECT $value$; -- trailing"
+        with patch(
+            "clickhouse_connect.driver.client._strip_trailing_semicolons",
+            wraps=_strip_trailing_semicolons,
+        ) as strip:
+            final_query, _, _ = self.prep(query, parameters={"$value$": b"13"})
+
+        assert final_query == b"SELECT $value$13$value$ -- trailing\n FORMAT TabSeparated"
+        strip.assert_called_once_with(query)
+
+    def test_mixed_binary_select_lexes_only_the_template(self):
+        query = "SELECT %(value)s + toUInt8($raw$); -- trailing"
+        with (
+            patch("clickhouse_connect.driver.client._query_is_insert", wraps=_query_is_insert) as is_insert,
+            patch(
+                "clickhouse_connect.driver.client._strip_trailing_semicolons",
+                wraps=_strip_trailing_semicolons,
+            ) as strip,
+        ):
+            final_query, _, _ = self.prep(query, parameters={"value": 13, "$raw$": b"79"})
+
+        assert final_query == b"SELECT 13 + toUInt8($raw$79$raw$) -- trailing\n FORMAT TabSeparated"
+        is_insert.assert_not_called()
+        strip.assert_called_once_with(query)
+
+    def test_binary_bind_with_unused_parameter_lexes_the_template(self):
+        query = "SELECT toUInt8($raw$); -- trailing"
+        with patch(
+            "clickhouse_connect.driver.client._strip_trailing_semicolons",
+            wraps=_strip_trailing_semicolons,
+        ) as strip:
+            final_query, _, _ = self.prep(query, parameters={"$raw$": b"13", "unused": 79})
+
+        assert final_query == b"SELECT toUInt8($raw$13$raw$) -- trailing\n FORMAT TabSeparated"
+        strip.assert_called_once_with(query)
+
+
+class TestInsertArrowTransportSettings:
+    """insert_arrow forwards transport_settings rather than passing them as compression."""
+
+    def test_insert_arrow_forwards_transport_settings(self):
+        with patch.object(Client, "_init_common_settings", autospec=True):
+            client = HttpClient(
+                interface="http",
+                host="localhost",
+                port=8123,
+                username="default",
+                password="",
+                database="default",
+            )
+        client.write_compression = None
+        transport = {"X-Test-Header": "1"}
+        with (
+            patch("clickhouse_connect.driver.client.check_arrow"),
+            patch("clickhouse_connect.driver.client.arrow_buffer", return_value=(["col_1"], b"block")),
+            patch.object(client, "_add_integration_tag"),
+            patch.object(client, "raw_insert", return_value=Mock()) as raw_insert,
+        ):
+            client.insert_arrow("some_table", Mock(), transport_settings=transport)
+        assert raw_insert.call_args.kwargs.get("transport_settings") == transport
+        assert transport not in raw_insert.call_args.args
+
+    @pytest.mark.asyncio
+    async def test_async_insert_arrow_forwards_transport_settings(self):
+        client = AsyncClient(
+            interface="http",
+            host="localhost",
+            port=8123,
+            username="default",
+            password="",
+            database="default",
+        )
+        client.write_compression = None
+        transport = {"X-Test-Header": "1"}
+        with (
+            patch("clickhouse_connect.driver.asyncclient.check_arrow"),
+            patch("clickhouse_connect.driver.asyncclient.arrow_buffer", return_value=(["col_1"], b"block")),
+            patch.object(client, "_add_integration_tag"),
+            patch.object(client, "raw_insert", new=AsyncMock(return_value=Mock())) as raw_insert,
+        ):
+            await client.insert_arrow("some_table", Mock(), transport_settings=transport)
+        assert raw_insert.call_args.kwargs.get("transport_settings") == transport
+        assert transport not in raw_insert.call_args.args
+
+
+class TestInsertArrowTableQuoting:
+    """insert_arrow quotes table/database identifiers like insert() via quote_identifier()."""
+
+    @staticmethod
+    def _sync_client() -> HttpClient:
+        with patch.object(Client, "_init_common_settings", autospec=True):
+            client = HttpClient(
+                interface="http",
+                host="localhost",
+                port=8123,
+                username="default",
+                password="",
+                database="default",
+            )
+        client.write_compression = None
+        return client
+
+    @staticmethod
+    def _async_client() -> AsyncClient:
+        client = AsyncClient(
+            interface="http",
+            host="localhost",
+            port=8123,
+            username="default",
+            password="",
+            database="default",
+        )
+        client.write_compression = None
+        return client
+
+    def _sync_raw_insert_table(self, table: str, database: str | None = None) -> str:
+        client = self._sync_client()
+        with (
+            patch("clickhouse_connect.driver.client.check_arrow"),
+            patch("clickhouse_connect.driver.client.arrow_buffer", return_value=(["col_1"], b"block")),
+            patch.object(client, "_add_integration_tag"),
+            patch.object(client, "raw_insert", return_value=Mock()) as raw_insert,
+        ):
+            client.insert_arrow(table, Mock(), database=database)
+        return raw_insert.call_args.args[0]
+
+    async def _async_raw_insert_table(self, table: str, database: str | None = None) -> str:
+        client = self._async_client()
+        with (
+            patch("clickhouse_connect.driver.asyncclient.check_arrow"),
+            patch("clickhouse_connect.driver.asyncclient.arrow_buffer", return_value=(["col_1"], b"block")),
+            patch.object(client, "_add_integration_tag"),
+            patch.object(client, "raw_insert", new=AsyncMock(return_value=Mock())) as raw_insert,
+        ):
+            await client.insert_arrow(table, Mock(), database=database)
+        return raw_insert.call_args.args[0]
+
+    @pytest.mark.parametrize(
+        "table, database, expected",
+        [
+            ("my-table", None, "`my-table`"),
+            ("my-table", "default", "`default`.`my-table`"),
+            ("`my-table`", None, "`my-table`"),
+            ("`my-table`", "default", "`default`.`my-table`"),
+            ("default.my-table", None, "default.my-table"),
+            ("default.my-table", "other", "default.my-table"),
+            ("user events", "my-db", "`my-db`.`user events`"),
+        ],
+    )
+    def test_insert_arrow_quotes_table_for_raw_insert(self, table, database, expected):
+        assert self._sync_raw_insert_table(table, database) == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "table, database, expected",
+        [
+            ("my-table", None, "`my-table`"),
+            ("my-table", "default", "`default`.`my-table`"),
+            ("`my-table`", None, "`my-table`"),
+            ("`my-table`", "default", "`default`.`my-table`"),
+            ("default.my-table", None, "default.my-table"),
+            ("default.my-table", "other", "default.my-table"),
+            ("user events", "my-db", "`my-db`.`user events`"),
+        ],
+    )
+    async def test_async_insert_arrow_quotes_table_for_raw_insert(self, table, database, expected):
+        assert await self._async_raw_insert_table(table, database) == expected
+
+
+class TestIPv6HostBrackets:
+    """RFC 3986 3.2.2: an IPv6 literal in a URI authority must be bracketed."""
+
+    @staticmethod
+    def _url(host: str) -> str:
+        with patch.object(Client, "_init_common_settings", autospec=True):
+            client = HttpClient(
+                interface="http",
+                host=host,
+                port=8123,
+                username="default",
+                password="",
+                database="default",
+            )
+        return client.url
+
+    def test_ipv6_host_is_bracketed(self):
+        # Without the brackets the first colon of the address reads as the
+        # port separator, so the client never reaches the server.
+        assert self._url("2001:db8::1") == "http://[2001:db8::1]:8123"
+        assert self._url("::1") == "http://[::1]:8123"
+
+    def test_already_bracketed_host_is_left_alone(self):
+        assert self._url("[2001:db8::1]") == "http://[2001:db8::1]:8123"
+
+    def test_names_and_ipv4_are_unchanged(self):
+        assert self._url("localhost") == "http://localhost:8123"
+        assert self._url("127.0.0.1") == "http://127.0.0.1:8123"
+        assert self._url("play.clickhouse.com") == "http://play.clickhouse.com:8123"
+
+    def test_async_client_uri_is_bracketed_too(self):
+        with patch.object(Client, "_init_common_settings", autospec=True):
+            client = AsyncClient(
+                interface="http",
+                host="2001:db8::1",
+                port=8123,
+                username="default",
+                password="",
+                database="default",
+            )
+        assert client.uri == "http://[2001:db8::1]:8123"

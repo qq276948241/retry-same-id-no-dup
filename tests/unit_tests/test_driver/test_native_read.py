@@ -1,0 +1,315 @@
+import struct
+from ipaddress import IPv4Address
+from uuid import UUID
+
+import pytest
+from clickhouse_connect.driverc.buffer import ResponseBuffer as CResponseBuffer
+
+from clickhouse_connect.datatypes import registry
+from clickhouse_connect.datatypes.dynamic import typed_variant
+from clickhouse_connect.driver.buffer import ResponseBuffer as PyResponseBuffer
+from clickhouse_connect.driver.exceptions import DataError, InternalError
+from clickhouse_connect.driver.insert import InsertContext
+from clickhouse_connect.driver.query import QueryContext, QueryResult
+from clickhouse_connect.driver.transform import NativeTransform
+from tests.helpers import bytes_source
+from tests.unit_tests.test_driver.binary import NESTED_BINARY
+
+UINT16_NULLS = """
+    0104 0969 6e74 5f76 616c 7565 104e 756c
+    6c61 626c 6528 5549 6e74 3136 2901 0001
+    0000 0014 0000 0028 00
+"""
+
+LOW_CARDINALITY = """
+    0102 026c 6316 4c6f 7743 6172 6469 6e61
+    6c69 7479 2853 7472 696e 6729 0100 0000
+    0000 0000 0006 0000 0000 0000 0300 0000
+    0000 0000 0004 4344 4d41 0347 534d 0200
+    0000 0000 0000 0102 0101 026c 6316 4c6f
+    7743 6172 6469 6e61 6c69 7479 2853 7472
+    696e 6729 0100 0000 0000 0000 0006 0000
+    0000 0000 0200 0000 0000 0000 0004 554d
+    5453 0100 0000 0000 0000 01
+ """
+
+LOW_CARD_ARRAY = """
+    0102 066c 6162 656c 731d 4172 7261 7928
+    4c6f 7743 6172 6469 6e61 6c69 7479 2853
+    7472 696e 6729 2901 0000 0000 0000 0000
+    0000 0000 0000 0000 0000 0000 0000 00
+"""
+
+SIMPLE_MAP = """
+    0101 066e 6e5f 6d61 7013 4d61 7028 5374
+    7269 6e67 2c20 5374 7269 6e67 2902 0000
+    0000 0000 0004 6b65 7931 046b 6579 3206
+    7661 6c75 6531 0676 616c 7565 32
+"""
+
+LOW_CARD_MAP = """
+    0102 086d 6170 5f6e 756c 6c2b 4d61 7028
+    4c6f 7743 6172 6469 6e61 6c69 7479 2853
+    7472 696e 6729 2c20 4e75 6c6c 6162 6c65
+    2855 5549 4429 2901 0000 0000 0000 0002
+    0000 0000 0000 0004 0000 0000 0000 0000
+    0600 0000 0000 0003 0000 0000 0000 0000
+    0469 676f 7206 6765 6f72 6765 0400 0000
+    0000 0000 0102 0102 0100 0000 0000 0000
+    0000 0000 0000 0000 0000 0000 235f 7dc5
+    799f 431d a9e1 93ca ccff c652 235f 7dc5
+    799f 437f a9e1 93ca ccff 0052 235f 7dc5
+    799f 431d a9e1 93ca ccff c652
+"""
+
+
+parse_response = NativeTransform().parse_response
+
+
+def check_result(result, expected, row_num=0, col_num=0):
+    result_set = result.result_set
+    row = result_set[row_num]
+    value = row[col_num]
+    assert value == expected
+
+
+def test_uint16_nulls():
+    result = parse_response(bytes_source(UINT16_NULLS))
+    assert result.result_set == [(None,), (20,), (None,), (40,)]
+
+
+def test_low_cardinality():
+    result = parse_response(bytes_source(LOW_CARDINALITY))
+    assert result.result_set == [("CDMA",), ("GSM",), ("UMTS",)]
+
+
+def test_low_card_array():
+    result = parse_response(bytes_source(LOW_CARD_ARRAY))
+    assert result.first_row == ([],), ([],)
+
+
+def test_map():
+    result = parse_response(bytes_source(SIMPLE_MAP))
+    check_result(result, {"key1": "value1", "key2": "value2"})
+    result = parse_response(bytes_source(LOW_CARD_MAP))
+    check_result(result, {"george": UUID("1d439f79-c57d-5f23-52c6-ffccca93e1a9"), "igor": None})
+
+
+def test_ip():
+    ips = ["192.168.5.3", "202.44.8.25", "0.0.2.2"]
+    ipv4_type = registry.get_from_name("IPv4")
+    dest = bytearray()
+    ipv4_type.write_column(ips, dest, InsertContext("", [], []))
+    python = ipv4_type.read_column_data(bytes_source(bytes(dest)), 3, QueryContext(), None)
+    assert tuple(python) == tuple(IPv4Address(ip) for ip in ips)
+
+
+def test_point():
+    points = ((3.22, 3.22), (5.22, 5.22), (4.22, 4.22))
+    point_type = registry.get_from_name("Point")
+    dest = bytearray()
+    point_type.write_column(points, dest, InsertContext("", [], []))
+    python = point_type.read_column_data(bytes_source(bytes(dest)), 3, QueryContext(), [None, None])
+    assert tuple(python) == tuple(point for point in points)
+
+
+@pytest.mark.parametrize(
+    ("type_name", "values"),
+    [
+        (
+            "MultiPoint",
+            [[(13.0, 23.0), (14.0, 24.0)], [], [(15.0, 25.0)]],
+        ),
+        (
+            "Array(MultiPoint)",
+            [[[(13.0, 23.0)], []], [], [[(14.0, 24.0), (15.0, 25.0)]]],
+        ),
+        (
+            "Tuple(MultiPoint, UInt8)",
+            [([(13.0, 23.0)], 7), ([], 13), ([(14.0, 24.0)], 79)],
+        ),
+        (
+            "Array(Tuple(MultiPoint, UInt8))",
+            [[([(13.0, 23.0)], 7)], [], [([], 13), ([(14.0, 24.0)], 79)]],
+        ),
+        (
+            "Map(String, MultiPoint)",
+            [
+                {"first": [(13.0, 23.0)]},
+                {},
+                {"second": [(14.0, 24.0), (15.0, 25.0)]},
+            ],
+        ),
+    ],
+)
+def test_multi_point_native_container_matrix(type_name, values):
+    ch_type = registry.get_from_name(type_name)
+    dest = bytearray()
+    ch_type.write_column(values, dest, InsertContext("", [], []))
+
+    source = bytes_source(bytes(dest))
+    assert list(ch_type.read_column(source, len(values), QueryContext())) == values
+
+
+def test_multi_point_registry_case_behavior():
+    assert registry.get_from_name("MultiPoint").name == "MultiPoint"
+    for spelling in ("multipoint", "MULTIPOINT"):
+        with pytest.raises(InternalError, match="Unrecognized ClickHouse type base"):
+            registry.get_from_name(spelling)
+
+
+def test_geometry():
+    tagged = [
+        typed_variant([(13.0, 23.0), (14.0, 24.0)], "LineString"),
+        typed_variant([[(31.0, 41.0), (32.0, 42.0)]], "MultiLineString"),
+        typed_variant([[[(51.0, 61.0)]]], "MultiPolygon"),
+        typed_variant((71.0, 81.0), "Point"),
+        typed_variant([[(91.0, 101.0), (92.0, 102.0)]], "Polygon"),
+        typed_variant([(111.0, 121.0)], "Ring"),
+        typed_variant([(131.0, 141.0), (132.0, 142.0)], "MultiPoint"),
+        None,
+    ]
+    expected = [value.value if value is not None else None for value in tagged]
+    expected_body = b"".join(
+        [
+            struct.pack("<Q", 0),
+            bytes([0, 1, 2, 3, 4, 5, 6, 255]),
+            struct.pack("<Q2d2d", 2, 13.0, 14.0, 23.0, 24.0),
+            struct.pack("<QQ2d2d", 1, 2, 31.0, 32.0, 41.0, 42.0),
+            struct.pack("<QQQdd", 1, 1, 1, 51.0, 61.0),
+            struct.pack("<dd", 71.0, 81.0),
+            struct.pack("<QQ2d2d", 1, 2, 91.0, 92.0, 101.0, 102.0),
+            struct.pack("<Qdd", 1, 111.0, 121.0),
+            struct.pack("<Q2d2d", 2, 131.0, 132.0, 141.0, 142.0),
+        ]
+    )
+    geometry_type = registry.get_from_name("Geometry")
+    dest = bytearray()
+    geometry_type.write_column(tagged, dest, InsertContext("", [], []))
+    assert bytes(dest) == expected_body
+
+    assert geometry_type.name == "Geometry"
+    assert geometry_type.python_type is None
+    assert geometry_type.valid_formats == ("typed", "native")
+    assert registry.get_from_name("GEOMETRY").name == "Geometry"
+    assert geometry_type.read_column(bytes_source(expected_body), len(tagged), QueryContext()) == expected
+    assert geometry_type.read_column(bytes_source(expected_body), len(tagged), QueryContext(query_formats={"Variant": "typed"})) == expected
+    assert geometry_type.read_column(bytes_source(expected_body), len(tagged), QueryContext(query_formats={"Geometry": "typed"})) == tagged
+
+
+@pytest.mark.parametrize("buffer_cls", [CResponseBuffer, PyResponseBuffer], ids=["cython", "python"])
+def test_geometry_unknown_discriminator_is_data_error(buffer_cls):
+    geometry_type = registry.get_from_name("Geometry")
+    source = bytes_source(struct.pack("<Q", 0) + b"\x07", cls=buffer_cls)
+    ctx = QueryContext()
+    ctx.start_column("geometry_value")
+
+    with pytest.raises(
+        DataError,
+        match=(
+            r"Column 'geometry_value' has Variant discriminator 7, but the type definition has 7 alternatives\. "
+            r"The server sent an unknown type member or the Native stream is corrupt\."
+        ),
+    ):
+        geometry_type.read_column(source, 1, ctx)
+
+
+@pytest.mark.parametrize("buffer_cls", [CResponseBuffer, PyResponseBuffer], ids=["cython", "python"])
+def test_empty_tuple_native_markers_and_stream_alignment(buffer_cls):
+    tuple_type = registry.get_from_name("Tuple()")
+    uint8_type = registry.get_from_name("UInt8")
+    source = bytes_source(b"000" + bytes((13, 79, 80)), cls=buffer_cls)
+
+    assert tuple_type.read_column_data(source, 3, QueryContext(), []) == ((), (), ())
+    assert list(uint8_type.read_column_data(source, 3, QueryContext(), None)) == [13, 79, 80]
+
+
+def test_empty_tuple_native_write_and_size():
+    tuple_type = registry.get_from_name("Tuple()")
+    dest = bytearray()
+
+    tuple_type.write_column_data([(), (), ()], dest, InsertContext("", [], []))
+
+    assert dest == b"000"
+    assert tuple_type.data_size([(), (), ()]) == 1
+
+
+@pytest.mark.parametrize("buffer_cls", [CResponseBuffer, PyResponseBuffer], ids=["cython", "python"])
+def test_nullable_empty_tuple_native_markers(buffer_cls):
+    tuple_type = registry.get_from_name("Nullable(Tuple())")
+    source = bytes_source(b"\x01\x00\x01" + b"000" + bytes((13, 79, 80)), cls=buffer_cls)
+    ctx = QueryContext()
+
+    assert tuple_type.read_column_data(source, 3, ctx, []) == [None, (), None]
+    assert list(registry.get_from_name("UInt8").read_column_data(source, 3, ctx, None)) == [13, 79, 80]
+
+    dest = bytearray()
+    tuple_type.write_column_data([None, (), None], dest, InsertContext("", [], []))
+    assert dest == b"\x01\x00\x01" + b"000"
+    assert tuple_type.data_size([None, (), None]) == 2
+    assert tuple_type.insert_name == "Nullable(Tuple())"
+
+
+@pytest.mark.parametrize(
+    "type_name, values, expected",
+    [
+        ("Array(Nullable(Tuple()))", [[None, ()], [], [()]], [[None, ()], [], [()]]),
+        (
+            "Tuple(Nullable(Tuple()), UInt8)",
+            [(None, 13), ((), 79), (None, 80)],
+            ((None, 13), ((), 79), (None, 80)),
+        ),
+    ],
+)
+@pytest.mark.parametrize("buffer_cls", [CResponseBuffer, PyResponseBuffer], ids=["cython", "python"])
+def test_nullable_empty_tuple_composes_in_containers(type_name, values, expected, buffer_cls):
+    ch_type = registry.get_from_name(type_name)
+    dest = bytearray()
+    ch_type.write_column(values, dest, InsertContext("", [], []))
+    source = bytes_source(bytes(dest) + bytes((13, 79, 80)), cls=buffer_cls)
+
+    assert ch_type.read_column(source, 3, QueryContext()) == expected
+    assert list(registry.get_from_name("UInt8").read_column(source, 3, QueryContext())) == [13, 79, 80]
+    assert ch_type.insert_name == type_name
+
+
+@pytest.mark.parametrize(
+    "type_name, value",
+    [
+        ("Tuple()", 13),
+        ("Tuple()", (13,)),
+        ("Tuple()", {}),
+        ("Tuple()", []),
+        ("Tuple()", None),
+        ("Nullable(Tuple())", (13,)),
+    ],
+)
+def test_empty_tuple_native_write_rejects_invalid_values(type_name, value):
+    tuple_type = registry.get_from_name(type_name)
+
+    with pytest.raises(DataError, match=r"Tuple\(\) values must be empty tuples"):
+        tuple_type.write_column_data([value], bytearray(), InsertContext("", [], []))
+
+
+def test_nested():
+    result = parse_response(bytes_source(NESTED_BINARY))
+    check_result(result, [{"str1": "one", "int32": 5}, {"str1": "two", "int32": 55}], 2, 0)
+
+
+def test_first_item_first_row_empty_result():
+    # An empty result set should return None rather than raising IndexError (#824).
+    columns = ("id", "name")
+    row_oriented = QueryResult([], column_names=columns, column_oriented=False)
+    assert row_oriented.first_item is None
+    assert row_oriented.first_row is None
+
+    col_oriented = QueryResult([[], []], column_names=columns, column_oriented=True)
+    assert col_oriented.first_item is None
+    assert col_oriented.first_row is None
+
+
+def test_first_item_first_row_non_empty_result():
+    columns = ("id", "name")
+    row_oriented = QueryResult([[1, "a"], [2, "b"]], column_names=columns, column_oriented=False)
+    assert row_oriented.first_item == {"id": 1, "name": "a"}
+    assert row_oriented.first_row == [1, "a"]

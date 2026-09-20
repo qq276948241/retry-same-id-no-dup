@@ -1,0 +1,1021 @@
+import uuid
+from collections.abc import Callable
+from pathlib import Path
+from time import sleep
+
+import pytest
+
+from clickhouse_connect import create_client, datatypes
+from clickhouse_connect.datatypes.format import set_default_formats
+from clickhouse_connect.driver.binding import quote_identifier
+from clickhouse_connect.driver.client import Client
+from clickhouse_connect.driver.exceptions import DatabaseError, InternalError, StreamFailureError
+from clickhouse_connect.driver.summary import QuerySummary
+from tests.integration_tests.conftest import TestConfig
+
+CSV_CONTENT = """abc,1,1
+abc,1,0
+def,1,0
+hij,1,1
+hij,1,
+klm,1,0
+klm,1,"""
+
+
+def _is_valid_uuid_v4(id_string: str) -> bool:
+    """Helper function to validate that a string is a valid UUID v4"""
+    try:
+        parsed_uuid = uuid.UUID(id_string)
+        return parsed_uuid.version == 4
+    except (ValueError, AttributeError):
+        return False
+
+
+def test_ping(param_client, call):
+    assert call(param_client.ping) is True
+
+
+def test_query(param_client, call):
+    result = call(param_client.query, "SELECT * FROM system.tables")
+    assert len(result.result_set) > 0
+    assert result.row_count > 0
+    assert result.first_item == next(result.named_results())
+
+
+def test_command(param_client, call):
+    version = call(param_client.command, "SELECT version()")
+    assert int(version.split(".")[0]) >= 19
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "SELECT 13 WHERE 0",
+        "SELECT number FROM numbers(0)",
+    ],
+)
+def test_command_empty_read_returns_empty_string(param_client, call, cmd):
+    # A read that produces zero rows returns an empty value, not a truthy QuerySummary (issue #865).
+    assert call(param_client.command, cmd) == ""
+
+
+def test_command_show_policies_returns_value(param_client, call):
+    # SHOW POLICIES produces a result set, so an empty policy list returns a value, not a QuerySummary (issue #761).
+    result = call(param_client.command, "SHOW POLICIES")
+    assert not isinstance(result, QuerySummary)
+
+
+def test_command_control_statement_returns_summary(param_client, call):
+    # A control statement produces no result set, so it still returns a QuerySummary.
+    result = call(param_client.command, "DROP TABLE IF EXISTS ch_connect_missing_865")
+    assert isinstance(result, QuerySummary)
+
+
+def test_query_error_exposes_structured_code(param_client, call):
+    with pytest.raises(DatabaseError) as excinfo:
+        call(param_client.query, "SELECT * FROM does_not_exist_tbl_xyz")
+    assert excinfo.value.code == 60
+    assert excinfo.value.name == "UNKNOWN_TABLE"
+
+
+@pytest.mark.parametrize("mode", ["scrub", False])
+def test_query_error_show_clickhouse_errors_modes(param_client, call, test_config: TestConfig, mode):
+    original = param_client.show_clickhouse_errors
+    param_client.show_clickhouse_errors = mode
+    try:
+        with pytest.raises(DatabaseError) as excinfo:
+            call(param_client.query, "SELECT * FROM does_not_exist_tbl_937")
+    finally:
+        param_client.show_clickhouse_errors = original
+
+    error_msg = str(excinfo.value)
+    assert excinfo.value.code == 60
+    if mode == "scrub":
+        assert excinfo.value.name == "UNKNOWN_TABLE"
+        assert "UNKNOWN_TABLE" in error_msg
+        assert "version" not in error_msg.lower()
+        assert param_client.url not in error_msg
+        assert test_config.host not in error_msg
+    else:
+        assert error_msg == "The ClickHouse server returned an error"
+        assert excinfo.value.name is None
+
+
+@pytest.mark.parametrize("mode", ["scrub", False])
+def test_stream_error_show_clickhouse_errors_modes(param_client, call, consume_stream, mode):
+    original = param_client.show_clickhouse_errors
+    param_client.show_clickhouse_errors = mode
+    try:
+        with pytest.raises(StreamFailureError) as excinfo:
+            stream = call(
+                param_client.query_rows_stream,
+                "SELECT sleepEachRow(0.01), throwIf(number = 100) FROM numbers(200)",
+                settings={"max_block_size": 1, "wait_end_of_query": 0},
+            )
+            consume_stream(stream)
+    finally:
+        param_client.show_clickhouse_errors = original
+
+    error_msg = str(excinfo.value)
+    if mode == "scrub":
+        assert "FUNCTION_THROW_IF_VALUE_IS_NON_ZERO" in error_msg
+        assert "version" not in error_msg.lower()
+        assert param_client.url not in error_msg
+    else:
+        assert error_msg == "The ClickHouse server returned an error"
+
+
+def test_client_name(param_client, client_mode):
+    user_agent = param_client.headers["User-Agent"]
+    assert "test" in user_agent or "param" in user_agent
+    assert "py/" in user_agent
+    assert f"mode:{client_mode}" in user_agent
+
+
+def test_transport_settings(param_client, call):
+    result = call(param_client.query, "SELECT name,database FROM system.tables", transport_settings={"X-Workload": "ONLINE"})
+    assert result.column_names == ("name", "database")
+    assert len(result.result_set) > 0
+
+
+def test_initial_settings_override_generated_defaults(client_factory):
+    client = client_factory(settings={"date_time_input_format": "basic"})
+    assert client.get_client_setting("date_time_input_format") == "basic"
+
+    default_client = client_factory()
+    assert default_client.get_client_setting("date_time_input_format") == "best_effort"
+
+
+def test_client_init_unaffected_by_global_read_formats(client_factory, call):
+    set_default_formats("String", "bytes")
+    client = client_factory()
+    assert isinstance(client.server_version, str)
+    assert client.get_client_setting("date_time_input_format") == "best_effort"
+    assert call(client.command, "SELECT 79") == 79
+
+
+def test_client_headers(client_factory, call):
+    client = client_factory(
+        headers={
+            "CF-Access-Client-Id": "test_client_id",
+            "CF-Access-Client-Secret": "test_client_secret",
+        }
+    )
+
+    assert client.headers["CF-Access-Client-Id"] == "test_client_id"
+    assert client.headers["CF-Access-Client-Secret"] == "test_client_secret"
+    assert call(client.command, "SELECT 79") == 79
+
+
+def test_legacy_default_database_sentinel(client_factory, call):
+    # "__default__" was the old default value for database and must still mean "not specified".
+    client = client_factory(database="__default__")
+    assert client.database is None
+    assert call(client.command, "SELECT 13") == 13
+
+
+def test_none_database(param_client, call):
+    old_db = param_client.database
+    test_db = call(param_client.command, "select currentDatabase()")
+    assert test_db == old_db
+    try:
+        param_client.database = None
+        call(param_client.query, "SELECT * FROM system.tables")
+        test_db = call(param_client.command, "select currentDatabase()")
+        assert test_db == "default"
+        param_client.database = old_db
+        test_db = call(param_client.command, "select currentDatabase()")
+        assert test_db == old_db
+    finally:
+        param_client.database = old_db
+
+
+def test_session_params(test_config: TestConfig, client_factory, call):
+    session_id = "TEST_SESSION_ID_" + test_config.test_database
+    client = client_factory(session_id=session_id)
+    result = call(client.query, "SELECT number FROM system.numbers LIMIT 5", settings={"query_id": "test_session_params"}).result_set
+    assert len(result) == 5
+
+    if test_config.host != "localhost":
+        return  # By default, the session log isn't enabled, so we only validate in environments we control
+
+    def check_session_in_log():
+        max_retries = 100
+        for _ in range(max_retries):
+            result = call(
+                client.query,
+                f"SELECT session_id, user FROM system.session_log WHERE session_id = '{session_id}' AND " + "event_time > now() - 30",
+            ).result_set
+
+            if len(result) > 0:
+                assert result[0] == (session_id, test_config.username)
+                return
+
+            sleep(0.1)
+
+        pytest.fail(f"session_id '{session_id}' did not appear in system.session_log after {max_retries * 0.1}s")
+
+    def check_query_in_log():
+        max_retries = 100
+        for _ in range(max_retries):
+            result = call(
+                client.query,
+                "SELECT query_id, user FROM system.query_log WHERE query_id = 'test_session_params' AND " + "event_time > now() - 30",
+            ).result_set
+
+            if len(result) > 0:
+                assert result[0] == ("test_session_params", test_config.username)
+                return
+
+            sleep(0.1)
+
+        pytest.fail(f"query_id 'test_session_params' did not appear in system.query_log after {max_retries * 0.1}s")
+
+    # Check both logs with smart retry logic
+    check_session_in_log()
+    check_query_in_log()
+
+
+def test_dsn_config(test_config: TestConfig):
+    session_id = "TEST_DSN_SESSION_" + test_config.test_database
+    dsn = (
+        f"clickhousedb://{test_config.username}:{test_config.password}@{test_config.host}:{test_config.port}"
+        + f"/{test_config.test_database}?session_id={session_id}&show_clickhouse_errors=false"
+    )
+    client = create_client(dsn=dsn)
+    try:
+        assert client.get_client_setting("session_id") == session_id
+        count = client.command("SELECT count() from system.tables")
+        assert client.database == test_config.test_database
+        assert count > 0
+        try:
+            client.query("SELECT nothing")
+        except DatabaseError as ex:
+            assert "returned an error" in str(ex)
+    finally:
+        client.close()
+
+
+def test_no_columns_and_types_when_no_results(param_client, call):
+    """In case of no results, the column names and types are not returned when FORMAT Native is set.
+    This may cause a lot of confusion.
+
+    Read more: https://github.com/ClickHouse/clickhouse-connect/issues/257
+    """
+    result = call(param_client.query, "SELECT name, database, NOW() as dt FROM system.tables WHERE FALSE")
+    assert result.column_names == ()
+    assert result.column_types == ()
+    assert result.result_set == []
+
+
+def test_get_columns_only(param_client, call):
+    result = call(param_client.query, "SELECT name, database, NOW() as dt FROM system.tables LIMIT 0")
+    assert result.column_names == ("name", "database", "dt")
+    assert len(result.column_types) == 3
+    assert isinstance(result.column_types[0], datatypes.string.String)
+    assert isinstance(result.column_types[1], datatypes.string.String)
+    assert isinstance(result.column_types[2], datatypes.temporal.DateTime)
+    assert len(result.result_set) == 0
+
+    call(param_client.query, "CREATE TABLE IF NOT EXISTS test_zero_insert (v Int8) ENGINE MergeTree() ORDER BY tuple()")
+    call(param_client.query, "INSERT INTO test_zero_insert SELECT 1 LIMIT 0")
+
+
+@pytest.mark.parametrize(
+    "sql, expected_rows, expected_name, expected_type",
+    [
+        (
+            "SELECT number FROM numbers(9) // LIMIT 0",
+            [(i,) for i in range(9)],
+            "number",
+            "UInt64",
+        ),
+        (
+            "SELECT number AS `LIMIT 0--` FROM numbers(9)",
+            [(i,) for i in range(9)],
+            "LIMIT 0--",
+            "UInt64",
+        ),
+        (
+            "SELECT 'foo\\' LIMIT 0--bar' AS value",
+            [("foo' LIMIT 0--bar",)],
+            "value",
+            "String",
+        ),
+        (
+            "SELECT number FROM numbers(9) LIMIT 0",
+            [],
+            "number",
+            "UInt64",
+        ),
+    ],
+)
+def test_limit_zero_probe_classification(
+    param_client,
+    call,
+    client_mode,
+    monkeypatch,
+    sql,
+    expected_rows,
+    expected_name,
+    expected_type,
+):
+    backend = param_client._backend
+    original_request = backend.request
+    execution_count = 0
+
+    if client_mode == "sync":
+
+        def counted_request(*args, **kwargs):
+            nonlocal execution_count
+            execution_count += 1
+            return original_request(*args, **kwargs)
+
+    else:
+
+        async def counted_request(*args, **kwargs):
+            nonlocal execution_count
+            execution_count += 1
+            return await original_request(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "request", counted_request)
+
+    result = call(param_client.query, sql)
+
+    assert execution_count == 1
+    assert result.result_rows == expected_rows
+    assert result.column_names == (expected_name,)
+    assert result.column_types[0].name == expected_type
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 13 AS v UNION ALL SELECT 79 AS v LIMIT 0",
+        "SELECT 13 AS v UNION DISTINCT SELECT 79 AS v LIMIT 0",
+        "SELECT 13 AS v EXCEPT SELECT 79 AS v LIMIT 0",
+        "EXPLAIN SELECT 13 LIMIT 0",
+        "EXPLAIN SYNTAX SELECT 13 LIMIT 0",
+    ],
+)
+def test_limit_zero_probe_rejects_rows_without_replay(param_client, call, client_mode, monkeypatch, sql):
+    backend = param_client._backend
+    original_request = backend.request
+    execution_count = 0
+
+    if client_mode == "sync":
+
+        def counted_request(*args, **kwargs):
+            nonlocal execution_count
+            execution_count += 1
+            return original_request(*args, **kwargs)
+
+    else:
+
+        async def counted_request(*args, **kwargs):
+            nonlocal execution_count
+            execution_count += 1
+            return await original_request(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "request", counted_request)
+
+    with pytest.raises(InternalError, match=r"metadata probe unexpectedly returned rows\. Use raw_query\(\)"):
+        call(param_client.query, sql)
+
+    assert execution_count == 1
+    assert call(param_client.query, "SELECT 79").result_rows == [(79,)]
+    assert execution_count == 2
+
+
+def test_no_limit(param_client, call):
+    old_limit = param_client.query_limit
+    param_client.limit = 0
+    result = call(param_client.query, "SELECT name FROM system.databases")
+    assert len(result.result_set) > 0
+    param_client.limit = old_limit
+
+
+def test_multiline_query(param_client, call):
+    result = call(
+        param_client.query,
+        """
+        SELECT *
+        FROM system.tables
+        """,
+    )
+    assert len(result.result_set) > 0
+
+
+def test_query_with_inline_comment(param_client, call):
+    result = call(
+        param_client.query,
+        """
+        SELECT *
+        -- This is just a comment
+        FROM system.tables LIMIT 77
+        -- A second comment
+        """,
+    )
+    assert len(result.result_set) > 0
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT 13;",
+        "SELECT 13;\n",
+        "SELECT 13;\u00a0",
+        "SELECT 13; /* trailing comment */",
+        "SELECT 13; /* separator */ ;",
+        "SELECT 13; /* inner; */ ;",
+    ],
+)
+def test_query_formats_with_trailing_semicolon(param_client, call, query):
+    assert call(param_client.query, query).result_rows == [(13,)]
+    assert call(param_client.raw_query, query, fmt="TabSeparated") == b"13\n"
+
+
+def test_limit_zero_with_trailing_semicolon_comment_keeps_metadata(param_client, call):
+    result = call(param_client.query, "SELECT 13 AS value LIMIT 0; /* trailing */")
+    assert result.column_names == ("value",)
+    assert result.result_rows == []
+
+
+def test_raw_query_binary_format_with_trailing_semicolon(param_client, call):
+    result = call(param_client.raw_query, "SELECT $value$;", parameters={"$value$": b"13"}, fmt="TabSeparated")
+    assert result == b"13\n"
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ("SELECT ' INSERT INTO '; -- trailing", b" INSERT INTO \n"),
+        ("WITH ' INSERT INTO ' AS value SELECT value; -- trailing", b" INSERT INTO \n"),
+    ],
+)
+def test_raw_insert_literal_with_trailing_semicolon_comment(param_client, call, query, expected):
+    assert call(param_client.raw_query, query, fmt="TabSeparated") == expected
+
+
+def test_query_insert_literal_with_trailing_semicolon_comment(param_client, call):
+    query = "SELECT ' INSERT INTO '; -- trailing"
+    assert call(param_client.query, query).result_rows == [(" INSERT INTO ",)]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "WITH insert AS (SELECT 13 AS n) SELECT * FROM insert",
+        "WITH 13 AS insert SELECT insert",
+    ],
+)
+def test_query_cte_named_insert_is_not_an_insert(param_client, call, query):
+    assert call(param_client.query, query).result_rows == [(13,)]
+    assert call(param_client.raw_query, query, fmt="TabSeparated") == b"13\n"
+
+
+def test_command_query_stream_with_trailing_semicolon_comment(param_client, call, consume_stream):
+    # Streamed entry points skip the query() command redirect, so the terminator must
+    # still come out before the transport appends a FORMAT clause.
+    stream = call(param_client.query_rows_stream, "KILL QUERY WHERE query_id = 'no_such_query_id' TEST; -- trailing")
+    rows = []
+    consume_stream(stream, rows.append)
+    assert rows == []
+
+
+def test_server_placeholder_names_do_not_change_with_routing(param_client, call, table_context):
+    with table_context("test_placeholder_name_routing", ["s String"]):
+        call(
+            param_client.query,
+            "WITH {SELECT:Int32} AS value INSERT INTO test_placeholder_name_routing (s) FORMAT TabSeparated\nvalue_1;\n",
+            parameters={"SELECT": 13},
+        )
+        assert call(param_client.query, "SELECT s FROM test_placeholder_name_routing").result_rows == [("value_1;",)]
+
+    result = call(
+        param_client.raw_query,
+        "WITH {INSERT:Int32} AS value SELECT value; -- trailing",
+        parameters={"INSERT": 13},
+        fmt="TabSeparated",
+    )
+    assert result == b"13\n"
+
+
+def test_mixed_binary_query_with_trailing_semicolon_comment(param_client, call):
+    query = "SELECT %(value)s + toUInt8($raw$); -- trailing"
+    parameters = {"value": 13, "$raw$": b"79"}
+    assert call(param_client.query, query, parameters=parameters).result_rows == [(92,)]
+    assert call(param_client.raw_query, query, parameters=parameters, fmt="TabSeparated") == b"92\n"
+
+
+@pytest.mark.parametrize("statement", ["SELECT 13;", "SELECT 13; -- trailing"])
+def test_parameter_generated_query_terminator(param_client, call, statement):
+    class StatefulStatement:
+        calls = 0
+
+        def __str__(self):
+            self.calls += 1
+            return statement
+
+    value = StatefulStatement()
+    assert call(param_client.query, "%(statement)s", parameters={"statement": value}).result_rows == [(13,)]
+    assert value.calls == 1
+
+    value = StatefulStatement()
+    assert (
+        call(
+            param_client.raw_query,
+            "%(statement)s",
+            parameters={"statement": value},
+            fmt="TabSeparated",
+        )
+        == b"13\n"
+    )
+    assert value.calls == 1
+
+
+def test_inline_insert_data_keeps_semicolons(param_client, call, table_context):
+    with table_context("test_inline_semicolon_data", ["s String"]):
+        call(param_client.command, "INSERT INTO test_inline_semicolon_data (s) FORMAT TabSeparated\nvalue_1;\n")
+        call(param_client.query, "INSERT INTO test_inline_semicolon_data (s) FORMAT TabSeparated\nvalue_2;\n")
+
+        class SqlKeyword:
+            def __str__(self):
+                return "INSERT"
+
+        call(
+            param_client.query,
+            "WITH 1 AS y %(verb)s INTO test_inline_semicolon_data (s) FORMAT TabSeparated\nvalue_3;\n",
+            parameters={"verb": SqlKeyword()},
+        )
+        result = call(param_client.query, "SELECT s FROM test_inline_semicolon_data ORDER BY s")
+        assert result.result_rows == [("value_1;",), ("value_2;",), ("value_3;",)]
+
+
+def test_raw_inline_insert_data_keeps_semicolons(param_client, call, consume_stream, table_context):
+    # The fmt suffix lands in the data region and can add junk rows, matching main,
+    # so assertions check membership rather than the exact row set.
+    with table_context("test_raw_inline_semicolon_data", ["s String"]):
+        call(
+            param_client.raw_query,
+            "INSERT INTO test_raw_inline_semicolon_data (s) FORMAT TabSeparated\nvalue_1;\n",
+            fmt="TabSeparated",
+        )
+        stream = call(
+            param_client.raw_stream,
+            "INSERT INTO test_raw_inline_semicolon_data (s) FORMAT TabSeparated\nvalue_2;\n",
+            fmt="TabSeparated",
+        )
+        consume_stream(stream)
+        call(
+            param_client.raw_query,
+            "INSERT INTO test_raw_inline_semicolon_data (s) FORMAT TabSeparated\nvalue_3;",
+            fmt="TabSeparated",
+        )
+        stream = call(
+            param_client.raw_stream,
+            "INSERT INTO test_raw_inline_semicolon_data (s) FORMAT TabSeparated\nvalue_4;",
+            fmt="TabSeparated",
+        )
+        consume_stream(stream)
+        result = call(param_client.query, "SELECT s FROM test_raw_inline_semicolon_data")
+        assert ("value_1;",) in result.result_rows
+        assert ("value_2;",) in result.result_rows
+        assert ("value_3;",) in result.result_rows
+        assert ("value_4;",) in result.result_rows
+
+
+def test_query_with_comment(param_client, call):
+    result = call(
+        param_client.query,
+        """
+        SELECT *
+        /* This is:
+        a multiline comment */
+        FROM system.tables
+        """,
+    )
+    assert len(result.result_set) > 0
+
+
+@pytest.mark.parametrize(
+    "sql, expected",
+    [
+        # the server reads a block comment as a token separator, so this is a SELECT and query_limit applies
+        ("SELECT/*c*/number FROM numbers(9)", [(0,), (1,)]),
+        # the query already has a LIMIT, so the client must not append its own
+        ("SELECT number FROM numbers(9)/*c*/LIMIT 1", [(0,)]),
+        ("SELECT number FROM numbers(9) LIMIT/*c*/1", [(0,)]),
+    ],
+)
+def test_query_with_comment_between_tokens(param_client, call, sql: str, expected: list):
+    old_limit = param_client.query_limit
+    param_client.query_limit = 2
+    try:
+        result = call(param_client.query, sql)
+    finally:
+        param_client.query_limit = old_limit
+    assert result.result_set == expected
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT name, database FROM system.tables LIMIT/*c*/0",
+        "SELECT name, database FROM system.tables LIMIT /*c*/0",
+        "SELECT name, database FROM system.tables LIMIT 0/*c*/",
+    ],
+)
+def test_get_columns_only_with_comment(param_client, call, sql: str):
+    # a comment anywhere around the trailing LIMIT 0 still reaches the columns only metadata probe
+    result = call(param_client.query, sql)
+    assert result.column_names == ("name", "database")
+    assert len(result.result_set) == 0
+
+
+def test_insert_csv_format(param_client, call, test_table_engine: str):
+    call(param_client.command, "DROP TABLE IF EXISTS test_csv")
+    call(
+        param_client.command,
+        'CREATE TABLE test_csv ("key" String, "val1" Int32, "val2" Int32) ' + f"ENGINE {test_table_engine} ORDER BY tuple()",
+    )
+    sql = f'INSERT INTO test_csv ("key", "val1", "val2") FORMAT CSV {CSV_CONTENT}'
+    call(param_client.command, sql)
+    result = call(param_client.query, "SELECT * from test_csv")
+
+    def compare_rows(row_1, row_2):
+        return all(c1 == c2 for c1, c2 in zip(row_1, row_2))
+
+    assert len(result.result_set) == 7
+    assert compare_rows(result.result_set[0], ["abc", 1, 1])
+    assert compare_rows(result.result_set[4], ["hij", 1, 0])
+
+
+def test_non_latin_query(param_client, call):
+    result = call(param_client.query, "SELECT database, name FROM system.tables WHERE engine_full IN ('空')")
+    assert len(result.result_set) == 0
+
+
+def test_error_decode(param_client, call):
+    try:
+        call(param_client.query, "SELECT database, name FROM system.tables WHERE has_own_data = '空'")
+    except DatabaseError as ex:
+        assert "空" in str(ex)
+
+
+def test_command_as_query(param_client, call):
+    # Test that non-SELECT and non-INSERT statements are treated as commands and
+    # just return the QueryResult metadata
+    result = call(param_client.query, "SET count_distinct_implementation = 'uniq'")
+    assert "query_id" in result.first_item
+
+
+def test_show_create(param_client, call):
+    result = call(param_client.query, "SHOW CREATE TABLE system.tables")
+    result.close()
+    assert "statement" in result.column_names
+
+
+def test_show_row_policies(param_client, call, table_context: Callable, test_config: TestConfig):
+    if test_config.cloud:
+        pytest.skip("Skipping row policy test in cloud env")
+
+    policy = "test_show_row_policies_policy"
+    table_name = "test_show_row_policies"
+    with table_context(table_name, ["id UInt32"]) as table:
+        target = f"{quote_identifier(param_client.database)}.{table.table}"
+        call(param_client.command, f"DROP ROW POLICY IF EXISTS {policy} ON {target}")
+        try:
+            for statement in ("SHOW ROW POLICIES", "SHOW POLICIES"):
+                assert call(param_client.command, f"{statement} ON {target}") == ""
+
+            call(param_client.command, f"CREATE ROW POLICY {policy} ON {target} USING id = 13 TO ALL")
+            listed = f"{policy} ON {param_client.database}.{table_name}"
+            for statement in ("SHOW ROW POLICIES", "SHOW POLICIES"):
+                assert call(param_client.command, f"{statement} ON {target}") == policy
+                result = call(param_client.query, statement)
+                assert listed in result.result_rows[0][0].splitlines()
+                result.close()
+        finally:
+            call(param_client.command, f"DROP ROW POLICY IF EXISTS {policy} ON {target}")
+
+
+def test_empty_result(param_client, call):
+    assert len(call(param_client.query, "SELECT * FROM system.tables WHERE name = '_NOT_A THING'").result_rows) == 0
+
+
+def test_temporary_tables(test_client: Client, test_config: TestConfig):
+    if test_config.cloud:
+        pytest.skip("Skipping temporary tables test in cloud env")
+
+    session_id = test_client.get_client_setting("session_id")
+    session_settings = {"session_id": session_id}
+    test_client.command(
+        """
+                        CREATE
+                        TEMPORARY TABLE temp_test_table
+            (
+                field1 String,
+                field2 String
+            )""",
+        settings=session_settings,
+    )
+
+    test_client.command(
+        "INSERT INTO temp_test_table (field1, field2) VALUES ('test1', 'test2'), ('test3', 'test4')",
+        settings=session_settings,
+    )
+    df = test_client.query_df("SELECT * FROM temp_test_table", settings=session_settings)
+    test_client.insert_df("temp_test_table", df, settings=session_settings)
+    df = test_client.query_df("SELECT * FROM temp_test_table", settings=session_settings)
+    assert len(df["field1"]) == 4
+    test_client.command("DROP TABLE IF EXISTS temp_test_table", settings=session_settings)
+
+
+def test_str_as_bytes(param_client, call, table_context: Callable):
+    with table_context("test_insert_bytes", ["key UInt32", "byte_str String", "n_byte_str Nullable(String)"]):
+        call(param_client.insert, "test_insert_bytes", [[0, "str_0", "n_str_0"], [1, "str_1", "n_str_0"]])
+        call(
+            param_client.insert,
+            "test_insert_bytes",
+            [
+                [2, "str_2".encode("ascii"), b"n_str_2"],
+                [3, b"str_3", b"str_3"],
+                [4, bytearray([5, 120, 24]), bytes([16, 48, 52])],
+                [5, b"", None],
+            ],
+        )
+        result_set = call(param_client.query, "SELECT * FROM test_insert_bytes ORDER BY key").result_columns
+        assert result_set[1][0] == "str_0"
+        assert result_set[1][3] == "str_3"
+        assert result_set[2][5] is None
+        assert result_set[1][4].encode() == b"\x05\x78\x18"
+        result_set = call(
+            param_client.query, "SELECT * FROM test_insert_bytes ORDER BY key", query_formats={"String": "bytes"}
+        ).result_columns
+        assert result_set[1][0] == b"str_0"
+        assert result_set[1][4] == b"\x05\x78\x18"
+        assert result_set[2][4] == b"\x10\x30\x34"
+
+
+def test_embedded_binary(param_client, call):
+    binary_params = {"$xx$": b"col1,col2\n100,700"}
+    result = call(param_client.raw_query, "SELECT col2, col1 FROM format(CSVWithNames, $xx$)", parameters=binary_params)
+    assert result == b"700\t100\n"
+
+    movies_file = f"{Path(__file__).parent}/movies.parquet"
+    with open(movies_file, "rb") as f:  # read bytes
+        data = f.read()
+    binary_params = {"$parquet$": data}
+    result = call(param_client.query, "SELECT movie, rating FROM format(Parquet, $parquet$) ORDER BY movie", parameters=binary_params)
+    assert result.first_item["movie"] == "12 Angry Men"
+
+    binary_params = {"$mult$": b"foobar"}
+    result = call(param_client.query, "SELECT $mult$ as m1, $mult$ as m2 WHERE m1 = 'foobar'", parameters=binary_params)
+    assert result.first_item["m2"] == "foobar"
+
+
+def test_column_rename_setting_none(client_factory, call):
+    sql = "SELECT 1 as `a.b.c d_e`"
+    client = client_factory()
+    names = call(client.query, sql).column_names
+    assert names[0] == "a.b.c d_e"
+
+
+def test_column_rename_limit_0_path(client_factory, call):
+    """Test column renaming with LIMIT 0 query (no data returned)."""
+    sql = "SELECT 1 as `a.b.c d_e` LIMIT 0"
+    client = client_factory(rename_response_column="to_camelcase_without_prefix")
+    names = call(client.query, sql).column_names
+    assert names[0] == "cDE"
+
+
+def test_column_rename_data_path(client_factory, call):
+    """Test column renaming with data returned."""
+    sql = "SELECT 1 as `a.b.c d_e`"
+    client = client_factory(rename_response_column="to_camelcase_without_prefix")
+    names = call(client.query, sql).column_names
+    assert names[0] == "cDE"
+
+
+def test_column_rename_with_bad_option(client_factory):
+    """Test that invalid rename option raises ValueError."""
+    with pytest.raises(ValueError, match="Invalid option"):
+        client_factory(rename_response_column="not_an_option")
+
+
+def test_role_setting_works(param_client: Client, test_config: TestConfig, client_factory: Callable, call):
+    if test_config.cloud:
+        pytest.skip("Skipping role test in cloud mode - cannot create custom users")
+
+    role_limited = "limit_rows_role"
+    user_limited = "limit_rows_user"
+    user_password = "R7m!pZt9qL#x"
+
+    call(param_client.command, f"CREATE ROLE IF NOT EXISTS {role_limited}")
+    call(param_client.command, f"CREATE USER IF NOT EXISTS {user_limited} IDENTIFIED BY '{user_password}'")
+    call(param_client.command, f"GRANT SELECT ON system.numbers TO {user_limited}")
+    call(param_client.command, f"GRANT {role_limited} TO {user_limited}")
+    call(param_client.command, f"SET DEFAULT ROLE NONE TO {user_limited}")
+
+    client = client_factory(
+        host=test_config.host,
+        port=test_config.port,
+        username=user_limited,
+        password=user_password,
+    )
+
+    # the default should not have the role
+    res = call(client.query, "SELECT currentRoles()")
+    assert res.result_rows == [([],)]
+
+    # passing it as a per-query setting should work
+    res = call(client.query, "SELECT currentRoles()", settings={"role": role_limited})
+    assert res.result_rows == [([role_limited],)]
+
+    # passing it as a per-client setting should work
+    role_client = client_factory(
+        host=test_config.host,
+        port=test_config.port,
+        username=user_limited,
+        password=user_password,
+        settings={"role": role_limited},
+    )
+    res = call(role_client.query, "SELECT currentRoles()")
+    assert res.result_rows == [([role_limited],)]
+
+
+def test_changeable_in_readonly_custom_setting(
+    param_client: Client, test_config: TestConfig, client_factory: Callable, client_mode: str, call
+):
+    """Readonly user can set CHANGEABLE_IN_READONLY custom settings via settings= (issue #530)."""
+    if test_config.cloud:
+        pytest.skip("Skipping role test in cloud mode - cannot create custom users")
+
+    # Docker test servers set custom_settings_prefixes=SQL_; skip otherwise.
+    try:
+        call(param_client.command, "SELECT 1 SETTINGS SQL_RO_probe_530='ok'")
+    except DatabaseError:
+        pytest.skip("Server does not allow SQL_ custom settings (need custom_settings_prefixes)")
+
+    # Roles and users are server global, so the sync and async runs need distinct names to
+    # stay isolated when xdist runs them in parallel.
+    role = f"ch_connect_ro_role_530_{client_mode}"
+    user = f"ch_connect_ro_user_530_{client_mode}"
+    password = "R7m!pZt9qL#x"
+    setting = "SQL_RO_my_rls_key"
+
+    try:
+        call(param_client.command, f"DROP USER IF EXISTS {user}")
+        call(param_client.command, f"DROP ROLE IF EXISTS {role}")
+
+        call(param_client.command, f"CREATE ROLE {role}")
+        # CHANGEABLE_IN_READONLY lets a readonly user set the custom setting even though it is
+        # not visible in system.settings for that user, which is what previously tripped the
+        # client into rejecting it. This mirrors the row-policy getSetting use case in #530.
+        call(param_client.command, f"ALTER ROLE {role} SETTINGS {setting} CHANGEABLE_IN_READONLY")
+        call(param_client.command, f"CREATE USER {user} IDENTIFIED BY '{password}' DEFAULT ROLE {role} SETTINGS readonly = 1")
+
+        # The readonly user cannot set the writable session defaults the factory normally applies,
+        # so opt out of them.
+        client = client_factory(username=user, password=password, apply_test_settings=False)
+
+        # Inline SETTINGS clause already works; the settings= path must match.
+        inline = call(client.query, f"SELECT getSetting('{setting}') AS v SETTINGS {setting}='tenant_1'")
+        assert inline.result_rows == [("tenant_1",)]
+
+        via_param = call(client.query, f"SELECT getSetting('{setting}') AS v", settings={setting: "tenant_1"})
+        assert via_param.result_rows == [("tenant_1",)]
+
+        # A different value takes effect per query, confirming the setting reaches the server.
+        other = call(client.query, f"SELECT getSetting('{setting}') AS v", settings={setting: "tenant_2"})
+        assert other.result_rows == [("tenant_2",)]
+    finally:
+        call(param_client.command, f"DROP USER IF EXISTS {user}")
+        call(param_client.command, f"DROP ROLE IF EXISTS {role}")
+
+
+def test_query_id_autogeneration(param_client: Client, test_table_engine: str, call):
+    """Test that query_id is auto-generated for query(), command(), and insert() methods"""
+    result = call(param_client.query, "SELECT 1")
+    assert _is_valid_uuid_v4(result.query_id)
+
+    summary = call(param_client.command, "DROP TABLE IF EXISTS test_query_id_nonexistent")
+    assert _is_valid_uuid_v4(summary.query_id())
+
+    call(param_client.command, "DROP TABLE IF EXISTS test_query_id_insert")
+    call(param_client.command, f"CREATE TABLE test_query_id_insert (id UInt32) ENGINE {test_table_engine} ORDER BY id")
+    summary = call(param_client.insert, "test_query_id_insert", [[1], [2], [3]], column_names=["id"])
+    assert _is_valid_uuid_v4(summary.query_id())
+    call(param_client.command, "DROP TABLE test_query_id_insert")
+
+
+def test_query_id_manual_override(param_client: Client, call):
+    """Test that manually specified query_id is respected and not overwritten"""
+    manual_query_id = "test_manual_query_id_override"
+    result = call(param_client.query, "SELECT 1", settings={"query_id": manual_query_id})
+    assert result.query_id == manual_query_id
+
+
+def test_query_id_disabled(client_factory, call):
+    """Test that autogenerate_query_id=False works correctly"""
+    client_no_autogen = client_factory(autogenerate_query_id=False)
+    assert client_no_autogen._autogenerate_query_id is False
+
+    # Even with autogen disabled, server generates a query_id
+    result = call(client_no_autogen.query, "SELECT 1")
+    assert _is_valid_uuid_v4(result.query_id)
+
+
+def test_query_id_in_query_logs(param_client: Client, test_config: TestConfig, call):
+    """Test that query_id appears in ClickHouse's system.query_log for observability"""
+    if test_config.cloud:
+        pytest.skip("Skipping query_log test in cloud environment")
+
+    def check_in_logs(test_query_id):
+        max_retries = 30
+        for _ in range(max_retries):
+            log_result = call(
+                param_client.query,
+                "SELECT query_id FROM system.query_log WHERE query_id = {query_id:String} AND event_time > now() - 30 LIMIT 1",
+                parameters={"query_id": test_query_id},
+            )
+
+            if len(log_result.result_set) > 0:
+                assert log_result.result_set[0][0] == test_query_id
+                return
+
+            sleep(0.1)
+
+        # If we get here, query_id never appeared in logs
+        pytest.fail(f"query_id '{test_query_id}' did not appear in system.query_log after {max_retries * 0.1}s")
+
+    # Manual override check
+    test_query_id_manual = f"test_query_id_in_logs_{uuid.uuid4()}"
+    call(param_client.query, "SELECT 1 as num", settings={"query_id": test_query_id_manual})
+    check_in_logs(test_query_id_manual)
+
+    # Autogen check
+    result = call(param_client.query, "SELECT 2 as num")
+    test_query_id_auto = result.query_id
+    check_in_logs(test_query_id_auto)
+
+
+def test_compression_enabled(client_factory, call, table_context):
+    """Test that compression works when enabled."""
+    client = client_factory(compress=True)
+
+    assert client.compression is not None
+    assert client.write_compression is not None
+
+    with table_context("test_compression", ["id", "data"], ["UInt32", "String"]):
+        data = [[i, f"data_{i}"] for i in range(100)]
+        call(client.insert, "test_compression", data)
+
+        result = call(client.query, "SELECT COUNT(*) FROM test_compression")
+        assert result.result_rows[0][0] == 100
+
+
+def test_compression_disabled(client_factory, call, table_context):
+    """Test that compression can be explicitly disabled."""
+    client = client_factory(compress=False)
+
+    assert client.compression is None
+    assert client.write_compression is None
+
+    with table_context("test_no_compression", ["id", "data"], ["UInt32", "String"]):
+        data = [[i, f"data_{i}"] for i in range(100)]
+        call(client.insert, "test_no_compression", data)
+
+        result = call(client.query, "SELECT COUNT(*) FROM test_no_compression")
+        assert result.result_rows[0][0] == 100
+
+
+def test_compression_gzip(client_factory, call, table_context):
+    """Test that gzip compression works."""
+    client = client_factory(compress="gzip")
+
+    assert client.compression == "gzip"
+    assert client.write_compression == "gzip"
+
+    with table_context("test_gzip", ["id", "data"], ["UInt32", "String"]):
+        data = [[i, f"data_{i}" * 10] for i in range(50)]
+        call(client.insert, "test_gzip", data)
+
+        result = call(client.query, "SELECT COUNT(*) FROM test_gzip")
+        assert result.result_rows[0][0] == 50
+
+
+def test_compression_zstd(client_factory, call, table_context):
+    """Test that zstd compression works."""
+    client = client_factory(compress="zstd")
+
+    assert client.compression == "zstd"
+    assert client.write_compression == "zstd"
+
+    with table_context("test_zstd", ["id", "data"], ["UInt32", "String"]):
+        data = [[i, f"data_{i}" * 10] for i in range(50)]
+        call(client.insert, "test_zstd", data)
+
+        result = call(client.query, "SELECT COUNT(*) FROM test_zstd")
+        assert result.result_rows[0][0] == 50
